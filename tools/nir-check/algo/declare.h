@@ -2,17 +2,17 @@ typedef struct {
     int field1;
     short field2;
     float field3;
-} A;
+} arg_of_awesome_func1;
 
 typedef struct {
     int field1;
     short field2;
     float field3;
-} B;
+} arg_of_awesome_func2;
 
 typedef struct {
     int field1;
     short field2;
     float field3;
-} C;
+} arg_of_awesome_func3;
 

@@ -41,9 +41,11 @@ const (
 
 func main() {
 
-	// locs := getStructs()
+	locs := getStructs()
 
-	generator()
+	// generator()
+
+	generateTests(locs)
 
 }
 
