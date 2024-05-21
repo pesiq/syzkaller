@@ -56,7 +56,7 @@ func getStructs() map[string]*ast.Struct {
 	var flagOS = flag.String("os", runtime.GOOS, "OS")
 
 	var arch = "amd64"
-	structTypes, locs, warnings, err := parseDescriptions_custom("syz_awesome_func.txt", *flagOS, arch)
+  structTypes, locs, warnings, err := parseDescriptions_custom("syz_padding_test.txt", *flagOS, arch)
 
 	if err != nil {
 		fmt.Errorf("Error: %v", err)
@@ -115,7 +115,7 @@ func parseDescriptions_custom(name, OS, arch string) ([]prog.Type, map[string]*a
 		fmt.Fprintf(errorBuf, "%v: %v\n", pos, msg)
 	}
 
-	top := ast.ParseGlob(filepath.Join("../../sys", OS, name), eh)
+	top := ast.ParseGlob(filepath.Join("./test/", name), eh)
 
 	fmt.Printf("top: %v \n", top)
 	if top == nil {
@@ -161,44 +161,6 @@ func parseDescriptions_custom(name, OS, arch string) ([]prog.Type, map[string]*a
 	// return nil, nil, nil, nil
 
 }
-
-// func parseDesc () {
-//   var filename = "./test/syz_test.txt"
-//   fmt.Println(filename)
-
-//   data, err := os.ReadFile(filename)
-
-//   if err != nil {
-//     fmt.Println("Err reading file: %v", err)
-//   }
-
-//   eh := func(pos ast.Pos, msg string) {
-//     fmt.Println("%v: %v", pos, err)
-//   }
-
-//   tree := ast.Parse(data, filename, eh)
-
-//   tokens := ast.Format(tree)
-
-//   for _, token := range tokens {
-//     fmt.Printf("%c ", token)
-//   }
-
-//   fmt.Println(ast.Format(tree))
-
-//   errorBuf := new(bytes.Buffer)
-
-//   OS = "linux"
-//   consts := compiler.DeserializeConstFile(filepath.Join("sys", OS, "*.const"), eh).Arch(arch)
-// 	if consts == nil {
-// 		fmt.Errorf("failed to parse const files:\n%s", errorBuf.Bytes())
-// 	}
-
-//   prg := compiler.Compile(top, consts, targets.Get(OS, arch), eh)
-// 	if prg == nil {
-// 		fmt.Errorf("failed to compile descriptions:\n%s", errorBuf.Bytes())
-// 	}
-// }
 
 func parseDescriptions(OS, arch string) ([]prog.Type, map[string]*ast.Struct, []Warn, error) {
 	errorBuf := new(bytes.Buffer)
