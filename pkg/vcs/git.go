@@ -134,17 +134,22 @@ func (git *git) CheckoutCommit(repo, commit string) (*Commit, error) {
 	if err := git.repair(); err != nil {
 		return nil, err
 	}
-	if err := git.fetchRemote(repo); err != nil {
+	if err := git.fetchRemote(repo, commit); err != nil {
 		return nil, err
 	}
 	return git.SwitchCommit(commit)
 }
 
-func (git *git) fetchRemote(repo string) error {
+func (git *git) fetchRemote(repo, commit string) error {
 	repoHash := hash.String([]byte(repo))
 	// Ignore error as we can double add the same remote and that will fail.
 	git.git("remote", "add", repoHash, repo)
-	_, err := git.git("fetch", "--force", "--tags", repoHash)
+	fetchArgs := []string{"fetch", "--force", "--tags", repoHash}
+	if commit != "" && gitFullHashRe.MatchString(commit) {
+		// This trick only works with full commit hashes.
+		fetchArgs = append(fetchArgs, commit)
+	}
+	_, err := git.git(fetchArgs...)
 	if err != nil {
 		var verbose *osutil.VerboseError
 		if errors.As(err, &verbose) &&
@@ -366,17 +371,6 @@ func (git *git) GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
 	return results, missing, nil
 }
 
-func (git *git) ListRecentCommits(baseCommit string) ([]string, error) {
-	// On upstream kernel this produces ~11MB of output.
-	// Somewhat inefficient to collect whole output in a slice
-	// and then convert to string, but should be bearable.
-	output, err := git.git("log", "--pretty=format:%s", "-n", "200000", baseCommit)
-	if err != nil {
-		return nil, err
-	}
-	return strings.Split(string(output), "\n"), nil
-}
-
 func (git *git) ListCommitHashes(baseCommit string) ([]string, error) {
 	output, err := git.git("log", "--pretty=format:%h", baseCommit)
 	if err != nil {
@@ -533,6 +527,8 @@ func (git *git) Bisect(bad, good string, dt debugtracer.DebugTracer, pred func()
 	}
 }
 
+var gitFullHashRe = regexp.MustCompile("[a-f0-9]{40}")
+
 func (git *git) bisectInconclusive(output []byte) ([]*Commit, error) {
 	// For inconclusive bisection git prints the following message:
 	//
@@ -547,7 +543,7 @@ func (git *git) bisectInconclusive(output []byte) ([]*Commit, error) {
 	//
 	//	7c3850adbcccc2c6c9e7ab23a7dcbc4926ee5b96 is the first bad commit
 	var commits []*Commit
-	for _, hash := range regexp.MustCompile("[a-f0-9]{40}").FindAll(output, -1) {
+	for _, hash := range gitFullHashRe.FindAll(output, -1) {
 		com, err := git.getCommit(string(hash))
 		if err != nil {
 			return nil, err

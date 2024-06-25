@@ -235,8 +235,17 @@ func (a *ResultArg) serialize(ctx *serializer) {
 type DeserializeMode int
 
 const (
-	Strict    DeserializeMode = iota
-	NonStrict DeserializeMode = iota
+	// In strict mode deserialization fails if the program is malformed in any way.
+	// This mode is used for manually written programs to ensure that they are correct.
+	Strict DeserializeMode = iota
+	// In non-strict mode malformed programs silently fixed in a best-effort way,
+	// e.g. missing/wrong arguments are replaced with default values.
+	// This mode is used for the corpus programs to "repair" them after descriptions changes.
+	NonStrict
+	// Unsafe mode is used for VM checking programs. In this mode programs are not fixed
+	// for safety, e.g. can access global files, issue prohibited ioctl's, disabled syscalls, etc.
+	StrictUnsafe
+	NonStrictUnsafe
 )
 
 func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, error) {
@@ -246,7 +255,9 @@ func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, err
 				err, target.OS, target.Arch, GitRevision, mode, data))
 		}
 	}()
-	p := newParser(target, data, mode == Strict)
+	strict := mode == Strict || mode == StrictUnsafe
+	unsafe := mode == StrictUnsafe || mode == NonStrictUnsafe
+	p := newParser(target, data, strict, unsafe)
 	prog, err := p.parseProg()
 	if err := p.Err(); err != nil {
 		return nil, err
@@ -257,21 +268,28 @@ func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, err
 	// This validation is done even in non-debug mode because deserialization
 	// procedure does not catch all bugs (e.g. mismatched types).
 	// And we can receive bad programs from corpus and hub.
-	if err := prog.validate(); err != nil {
+	if err := prog.validateWithOpts(validationOptions{
+		// Don't validate auto-set conditional fields. We'll patch them later.
+		ignoreTransient: true,
+	}); err != nil {
 		return nil, err
 	}
+	p.fixupConditionals(prog)
 	if p.autos != nil {
 		p.fixupAutos(prog)
 	}
-	if err := prog.sanitize(mode == NonStrict); err != nil {
-		return nil, err
+	if !unsafe {
+		if err := prog.sanitize(!strict); err != nil {
+			return nil, err
+		}
 	}
 	return prog, nil
 }
 
 func (p *parser) parseProg() (*Prog, error) {
 	prog := &Prog{
-		Target: p.target,
+		Target:   p.target,
+		isUnsafe: p.unsafe,
 	}
 	for p.Scan() {
 		if p.EOF() {
@@ -457,7 +475,7 @@ func (p *parser) parseArgImpl(typ Type, dir Dir) (Arg, error) {
 		return p.parseAuto(typ, dir)
 	default:
 		return nil, fmt.Errorf("failed to parse argument at '%c' (line #%v/%v: %v)",
-			p.Char(), p.l, p.i, p.s)
+			p.Char(), p.l, p.i, highlightError(p.s, p.i))
 	}
 }
 
@@ -543,9 +561,10 @@ func (p *parser) parseArgRes(typ Type, dir Dir) (Arg, error) {
 func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 	var elem Type
 	elemDir := DirInOut
+	squashableElem := false
 	switch t1 := typ.(type) {
 	case *PtrType:
-		elem, elemDir = t1.Elem, t1.ElemDir
+		elem, elemDir, squashableElem = t1.Elem, t1.ElemDir, t1.SquashableElem
 	case *VmaType:
 	default:
 		p.eatExcessive(true, "wrong addr arg %T", typ)
@@ -578,8 +597,10 @@ func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 			p.Parse('N')
 			p.Parse('Y')
 			p.Parse('=')
-			anyPtr := p.target.getAnyPtrType(typ.Size())
-			typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			if squashableElem {
+				anyPtr := p.target.getAnyPtrType(typ.Size())
+				typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			}
 		}
 		var err error
 		inner, err = p.parseArg(elem, elemDir)
@@ -747,6 +768,7 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	var (
 		optType Type
 		optDir  Dir
+		options []string
 	)
 	index := -1
 	for i, field := range t1.Fields {
@@ -754,9 +776,11 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 			optType, index, optDir = field.Type, i, field.Dir(dir)
 			break
 		}
+		options = append(options, fmt.Sprintf("%q", field.Name))
 	}
 	if optType == nil {
-		p.eatExcessive(true, "wrong union option")
+		p.eatExcessive(true, "wrong option %q of union %q, available options are: %s",
+			name, typ.Name(), strings.Join(options, ", "))
 		return typ.DefaultArg(dir), nil
 	}
 	var opt Arg
@@ -837,31 +861,8 @@ func (p *parser) parseAddr() (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to parse addr: %q", pstr)
 	}
-	if addr < encodingAddrBase {
-		return 0, 0, fmt.Errorf("address without base offset: %q", pstr)
-	}
 	addr -= encodingAddrBase
-	// This is not used anymore, but left here to parse old programs.
-	if p.Char() == '+' || p.Char() == '-' {
-		minus := false
-		if p.Char() == '-' {
-			minus = true
-			p.Parse('-')
-		} else {
-			p.Parse('+')
-		}
-		ostr := p.Ident()
-		off, err := strconv.ParseUint(ostr, 0, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse addr offset: %q", ostr)
-		}
-		if minus {
-			off = -off
-		}
-		addr += off
-	}
 	target := p.target
-	maxMem := target.NumPages * target.PageSize
 	var vmaSize uint64
 	if p.Char() == '/' {
 		p.Parse('/')
@@ -875,11 +876,14 @@ func (p *parser) parseAddr() (uint64, uint64, error) {
 		if vmaSize == 0 {
 			vmaSize = target.PageSize
 		}
-		if vmaSize > maxMem {
-			vmaSize = maxMem
-		}
-		if addr > maxMem-vmaSize {
-			addr = maxMem - vmaSize
+		if !p.unsafe {
+			maxMem := target.NumPages * target.PageSize
+			if vmaSize > maxMem {
+				vmaSize = maxMem
+			}
+			if addr > maxMem-vmaSize {
+				addr = maxMem - vmaSize
+			}
 		}
 	}
 	p.Parse(')')
@@ -1096,6 +1100,7 @@ func fromHexChar(v byte) (byte, bool) {
 type parser struct {
 	target  *Target
 	strict  bool
+	unsafe  bool
 	vars    map[string]*ResultArg
 	autos   map[Arg]bool
 	comment string
@@ -1107,10 +1112,11 @@ type parser struct {
 	e    error
 }
 
-func newParser(target *Target, data []byte, strict bool) *parser {
+func newParser(target *Target, data []byte, strict, unsafe bool) *parser {
 	p := &parser{
 		target: target,
 		strict: strict,
+		unsafe: unsafe,
 		vars:   make(map[string]*ResultArg),
 		data:   data,
 	}
@@ -1148,6 +1154,13 @@ func (p *parser) fixupAutos(prog *Prog) {
 	}
 	if len(p.autos) != 0 {
 		panic(fmt.Sprintf("leftoever autos: %+v", p.autos))
+	}
+}
+
+func (p *parser) fixupConditionals(prog *Prog) {
+	for _, c := range prog.Calls {
+		// Only overwrite transient union fields.
+		c.setDefaultConditions(p.target, true)
 	}
 }
 
@@ -1261,7 +1274,8 @@ func (p *parser) Ident() string {
 
 func (p *parser) failf(msg string, args ...interface{}) {
 	if p.e == nil {
-		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i, p.s)
+		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i,
+			highlightError(p.s, p.i))
 	}
 }
 
@@ -1310,4 +1324,8 @@ func CallSet(data []byte) (map[string]struct{}, int, error) {
 		return nil, 0, fmt.Errorf("program does not contain any calls")
 	}
 	return calls, ncalls, nil
+}
+
+func highlightError(s string, offset int) string {
+	return s[:offset] + "<<<!!ERROR!!>>>" + s[offset:]
 }

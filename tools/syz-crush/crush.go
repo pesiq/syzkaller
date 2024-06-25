@@ -143,7 +143,7 @@ func storeCrash(cfg *mgrconfig.Config, res *instance.RunResult) {
 	if err := osutil.WriteFile(filepath.Join(dir, "description"), []byte(rep.Title+"\n")); err != nil {
 		log.Printf("failed to write crash description: %v", err)
 	}
-	if err := osutil.WriteFile(filepath.Join(dir, fmt.Sprintf("log%v", index)), res.RawOutput); err != nil {
+	if err := osutil.WriteFile(filepath.Join(dir, fmt.Sprintf("log%v", index)), res.Output); err != nil {
 		log.Printf("failed to write crash log: %v", err)
 	}
 	if err := osutil.WriteFile(filepath.Join(dir, fmt.Sprintf("tag%v", index)), []byte(cfg.Tag)); err != nil {
@@ -162,9 +162,7 @@ func storeCrash(cfg *mgrconfig.Config, res *instance.RunResult) {
 func runInstance(cfg *mgrconfig.Config, reporter *report.Reporter,
 	vmPool *vm.Pool, index int, timeout time.Duration, runType FileType) *instance.RunResult {
 	log.Printf("vm-%v: starting", index)
-	optArgs := &instance.OptionalConfig{
-		ExitCondition: vm.ExitTimeout,
-	}
+	optArgs := &instance.OptionalConfig{}
 	if *flagStrace {
 		optArgs.StraceBin = cfg.StraceBin
 	}
@@ -180,7 +178,7 @@ func runInstance(cfg *mgrconfig.Config, reporter *report.Reporter,
 	if runType == LogFile {
 		opts := csource.DefaultOpts(cfg)
 		opts.Repeat, opts.Threaded = true, true
-		res, err = inst.RunSyzProgFile(file, timeout, opts)
+		res, err = inst.RunSyzProgFile(file, timeout, opts, instance.SyzExitConditions)
 	} else {
 		var src []byte
 		src, err = os.ReadFile(file)

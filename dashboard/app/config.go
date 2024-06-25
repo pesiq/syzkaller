@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/mail"
@@ -17,7 +18,6 @@ import (
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vcs"
-	"golang.org/x/net/context"
 )
 
 // There are multiple configurable aspects of the app (namespaces, reporting, API clients, etc).
@@ -94,6 +94,9 @@ type Config struct {
 	FixBisectionAutoClose bool
 	// If set, dashboard will periodically request repros and revoke no longer working ones.
 	RetestRepros bool
+	// If set, dashboard will periodically verify the presence of the missing backports in the
+	// tested kernel trees.
+	RetestMissingBackports bool
 	// If set, dashboard will create patch testing jobs to determine bug origin trees.
 	FindBugOriginTrees bool
 	// Managers contains some special additional info about syz-manager instances.

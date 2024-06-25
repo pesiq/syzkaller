@@ -254,12 +254,6 @@ var archConfigs = map[string]*archConfig{
 			"kernel.lockup-detector.heartbeat-age-fatal-threshold-ms=300000",
 		},
 	},
-	"akaros/amd64": {
-		Qemu:     "qemu-system-x86_64",
-		QemuArgs: "-enable-kvm -cpu host,migratable=off",
-		NetDev:   "e1000",
-		RngDev:   "virtio-rng-pci",
-	},
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -376,7 +370,7 @@ func (pool *Pool) ctor(workdir, sshkey, sshuser string, index int) (vmimpl.Insta
 		sshuser:    sshuser,
 		diagnose:   make(chan bool, 1),
 	}
-	if st, err := os.Stat(inst.image); err != nil && st.Size() == 0 {
+	if st, err := os.Stat(inst.image); err == nil && st.Size() == 0 {
 		// Some kernels may not need an image, however caller may still
 		// want to pass us a fake empty image because the rest of syzkaller
 		// assumes that an image is mandatory. So if the image is empty, we ignore it.
@@ -425,6 +419,7 @@ func (inst *instance) Close() {
 func (inst *instance) boot() error {
 	inst.port = vmimpl.UnusedTCPPort()
 	inst.monport = vmimpl.UnusedTCPPort()
+	instanceName := fmt.Sprintf("VM-%v", inst.index)
 	args := []string{
 		"-m", strconv.Itoa(inst.cfg.Mem),
 		"-smp", strconv.Itoa(inst.cfg.CPU),
@@ -433,16 +428,18 @@ func (inst *instance) boot() error {
 		"-display", "none",
 		"-serial", "stdio",
 		"-no-reboot",
-		"-name", fmt.Sprintf("VM-%v", inst.index),
+		"-name", instanceName,
 	}
 	if inst.archConfig.RngDev != "" {
 		args = append(args, "-device", inst.archConfig.RngDev)
 	}
 	templateDir := filepath.Join(inst.workdir, "template")
 	args = append(args, splitArgs(inst.cfg.QemuArgs, templateDir, inst.index)...)
+
 	args = append(args,
 		"-device", inst.cfg.NetDev+",netdev=net0",
-		"-netdev", fmt.Sprintf("user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:%v-:22", inst.port))
+		"-netdev", fmt.Sprintf("user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:%v-:22", inst.port),
+	)
 	if inst.image == "9p" {
 		args = append(args,
 			"-fsdev", "local,id=fsdev0,path=/,security_model=none,readonly",
@@ -543,7 +540,7 @@ func (inst *instance) boot() error {
 		}
 	}()
 	if err := vmimpl.WaitForSSH(inst.debug, 10*time.Minute*inst.timeouts.Scale, "localhost",
-		inst.sshkey, inst.sshuser, inst.os, inst.port, inst.merger.Err); err != nil {
+		inst.sshkey, inst.sshuser, inst.os, inst.port, inst.merger.Err, false); err != nil {
 		bootOutputStop <- true
 		<-bootOutputStop
 		return vmimpl.MakeBootError(err, bootOutput)
@@ -616,7 +613,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDst := filepath.Join(inst.targetDir(), base)
 	if inst.target.HostFuzzer {
-		if base == "syz-fuzzer" || base == "syz-execprog" {
+		if base == "syz-execprog" {
 			return hostSrc, nil // we will run these on host
 		}
 		if inst.files == nil {
@@ -625,7 +622,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 		inst.files[vmDst] = hostSrc
 	}
 
-	args := append(vmimpl.SCPArgs(inst.debug, inst.sshkey, inst.port),
+	args := append(vmimpl.SCPArgs(inst.debug, inst.sshkey, inst.port, false),
 		hostSrc, inst.sshuser+"@localhost:"+vmDst)
 	if inst.debug {
 		log.Logf(0, "running command: scp %#v", args)
@@ -645,11 +642,10 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 	inst.merger.Add("ssh", rpipe)
 
-	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshkey, inst.port, inst.forwardPort)
+	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshkey, inst.port, inst.forwardPort, false)
 	args := strings.Split(command, " ")
-	if bin := filepath.Base(args[0]); inst.target.HostFuzzer &&
-		(bin == "syz-fuzzer" || bin == "syz-execprog") {
-		// Weird mode for fuchsia and akaros.
+	if bin := filepath.Base(args[0]); inst.target.HostFuzzer && bin == "syz-execprog" {
+		// Weird mode for Fuchsia.
 		// Fuzzer and execprog are on host (we did not copy them), so we will run them as is,
 		// but we will also wrap executor with ssh invocation.
 		for i, arg := range args {
@@ -744,7 +740,7 @@ func (inst *instance) ssh(args ...string) ([]byte, error) {
 }
 
 func (inst *instance) sshArgs(args ...string) []string {
-	sshArgs := append(vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.port), inst.sshuser+"@localhost")
+	sshArgs := append(vmimpl.SSHArgs(inst.debug, inst.sshkey, inst.port, false), inst.sshuser+"@localhost")
 	return append(sshArgs, args...)
 }
 

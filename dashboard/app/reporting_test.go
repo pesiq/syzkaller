@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"reflect"
@@ -16,7 +17,6 @@ import (
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/context"
 )
 
 func TestReportBug(t *testing.T) {
@@ -272,20 +272,66 @@ func TestReportingQuota(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
+	c.updateReporting("test1", "reporting1",
+		func(r Reporting) Reporting {
+			// Set a low daily limit.
+			r.DailyLimit = 2
+			return r
+		})
+
 	build := testBuild(1)
 	c.client.UploadBuild(build)
 
-	const numReports = 8 // quota is 3 per day
+	const numReports = 5
 	for i := 0; i < numReports; i++ {
 		c.client.ReportCrash(testCrash(build, i))
 	}
 
-	for _, reports := range []int{3, 3, 2, 0, 0} {
+	for _, reports := range []int{2, 2, 1, 0, 0} {
 		c.advanceTime(24 * time.Hour)
 		c.client.pollBugs(reports)
 		// Out of quota for today, so must get 0 reports.
 		c.client.pollBugs(0)
 	}
+}
+
+func TestReproReportingQuota(t *testing.T) {
+	// Test that new repro reports are also covered by daily limits.
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client
+	c.updateReporting("test1", "reporting1",
+		func(r Reporting) Reporting {
+			// Set a low daily limit.
+			r.DailyLimit = 2
+			return r
+		})
+
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	// First report of two.
+	c.advanceTime(time.Minute)
+	client.ReportCrash(testCrash(build, 1))
+	client.pollBug()
+
+	// Second report of two.
+	c.advanceTime(time.Minute)
+	crash := testCrash(build, 2)
+	client.ReportCrash(crash)
+	client.pollBug()
+
+	// Now we "find" a reproducer.
+	c.advanceTime(time.Minute)
+	client.ReportCrash(testCrashWithRepro(build, 1))
+
+	// But there's no quota for it.
+	client.pollBugs(0)
+
+	// Wait a day and the quota appears.
+	c.advanceTime(time.Hour * 24)
+	client.pollBug()
 }
 
 // Basic dup scenario: mark one bug as dup of another.
@@ -922,10 +968,10 @@ func TestUpdateBugReporting(t *testing.T) {
 		setIDs(bug, test.After)
 		hasError := bug.updateReportings(c.ctx, cfg, now) != nil
 		if hasError != test.Error {
-			t.Errorf("Before: %#v, Expected error: %v, Got error: %v", test.Before, test.Error, hasError)
+			t.Errorf("before: %#v, expected error: %v, got error: %v", test.Before, test.Error, hasError)
 		}
 		if !test.Error && !reflect.DeepEqual(bug.Reporting, test.After) {
-			t.Errorf("Before: %#v, Expected After: %#v, Got After: %#v", test.Before, test.After, bug.Reporting)
+			t.Errorf("before: %#v, expected after: %#v, got after: %#v", test.Before, test.After, bug.Reporting)
 		}
 	}
 }
@@ -1173,4 +1219,84 @@ func TestObsoletePeriod(t *testing.T) {
 			assert.Equal(t, test.period, ret)
 		})
 	}
+}
+
+func TestReportRevokedRepro(t *testing.T) {
+	// There was a bug (#4412) where syzbot infinitely re-reported reproducers
+	// for a bug that was upstreamed after its repro was revoked.
+	// Recreate this situation.
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.makeClient(clientPublic, keyPublic, true)
+	build := testBuild(1)
+	build.KernelRepo = "git://mygit.com/git.git"
+	build.KernelBranch = "main"
+	client.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	crash.ReproOpts = []byte("repro opts")
+	crash.ReproSyz = []byte("repro syz")
+	client.ReportCrash(crash)
+	rep1 := client.pollBug()
+	client.expectNE(rep1.ReproSyz, nil)
+
+	// Revoke the reproducer.
+	c.advanceTime(c.config().Obsoleting.ReproRetestStart + time.Hour)
+	jobResp := client.pollSpecificJobs(build.Manager, dashapi.ManagerJobs{TestPatches: true})
+	c.expectEQ(jobResp.Type, dashapi.JobTestPatch)
+	client.expectOK(client.JobDone(&dashapi.JobDoneReq{
+		ID: jobResp.ID,
+	}))
+
+	c.advanceTime(time.Hour)
+	client.ReportCrash(testCrash(build, 1))
+
+	// Upstream the bug.
+	c.advanceTime(time.Hour)
+	client.updateBug(rep1.ID, dashapi.BugStatusUpstream, "")
+	rep2 := client.pollBug()
+
+	// Also ensure that we do not report the revoked reproducer.
+	client.expectEQ(rep2.Type, dashapi.ReportNew)
+	client.expectEQ(rep2.ReproSyz, []byte(nil))
+
+	// Expect no further reports.
+	client.pollBugs(0)
+}
+
+func TestWaitForRepro(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.client
+	c.setWaitForRepro("test1", time.Hour*24)
+
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	// Normal crash witout repro.
+	client.ReportCrash(testCrash(build, 1))
+	client.pollBugs(0)
+	c.advanceTime(time.Hour * 24)
+	client.pollBug()
+
+	// A crash first without repro, then with it.
+	client.ReportCrash(testCrash(build, 2))
+	c.advanceTime(time.Hour * 12)
+	client.pollBugs(0)
+	client.ReportCrash(testCrashWithRepro(build, 2))
+	client.pollBug()
+
+	// A crash with a reproducer.
+	c.advanceTime(time.Minute)
+	client.ReportCrash(testCrashWithRepro(build, 3))
+	client.pollBug()
+
+	// A crahs that will never have a reproducer.
+	c.advanceTime(time.Minute)
+	crash := testCrash(build, 4)
+	crash.Title = "upstream test error: abcd"
+	client.ReportCrash(crash)
+	client.pollBug()
 }

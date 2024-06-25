@@ -5,6 +5,7 @@ package vcs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/mail"
 	"path/filepath"
@@ -192,10 +193,10 @@ func linuxGCCPath(tags map[string]bool, binDir, defaultCompiler string) string {
 }
 
 func (ctx *linux) PrepareBisect() error {
-	if ctx.vmType != "gvisor" {
+	if ctx.vmType != targets.GVisor {
 		// Some linux repos we fuzz don't import the upstream release git tags. We need tags
 		// to decide which compiler versions to use. Let's fetch upstream for its tags.
-		err := ctx.git.fetchRemote("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git")
+		err := ctx.git.fetchRemote("https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git", "")
 		if err != nil {
 			return fmt.Errorf("fetching upstream linux failed: %w", err)
 		}
@@ -274,6 +275,8 @@ func ParseMaintainersLinux(text []byte) Recipients {
 	return mtrs
 }
 
+var ErrBadKconfig = errors.New("failed to parse Kconfig")
+
 const configBisectTag = "# Minimized by syzkaller"
 
 // Minimize() attempts to drop Linux kernel configs that are unnecessary(*) for bug reproduction.
@@ -289,7 +292,7 @@ func (ctx *linux) Minimize(target *targets.Target, original, baseline []byte, ty
 	}
 	kconf, err := kconfig.Parse(target, filepath.Join(ctx.git.dir, "Kconfig"))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Kconfig: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrBadKconfig, err)
 	}
 	config, err := kconfig.ParseConfigData(original, "original")
 	if err != nil {
@@ -324,8 +327,10 @@ func (ctx *linux) Minimize(target *targets.Target, original, baseline []byte, ty
 	}
 	if len(baseline) > 0 {
 		baselineConfig, err := kconfig.ParseConfigData(baseline, "baseline")
+		// If we fail to parse the baseline config proceed with original one as baseline config
+		// is an optional parameter.
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrBadKconfig, err)
 		}
 		err = minimizeCtx.minimizeAgainst(baselineConfig)
 		if err != nil {

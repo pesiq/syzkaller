@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,7 +13,7 @@ import (
 	"strconv"
 	"time"
 
-	"golang.org/x/net/context"
+	"cloud.google.com/go/civil"
 	db "google.golang.org/appengine/v2/datastore"
 )
 
@@ -24,6 +25,12 @@ type uiKernelHealthPage struct {
 type uiBugLifetimesPage struct {
 	Header    *uiHeader
 	Lifetimes []uiBugLifetime
+}
+
+type uiHistogramPage struct {
+	Title  string
+	Header *uiHeader
+	Graph  *uiGraph
 }
 
 type uiBugLifetime struct {
@@ -53,8 +60,13 @@ type uiCrashesPage struct {
 }
 
 type uiGraph struct {
-	Headers []string
+	Headers []uiGraphHeader
 	Columns []uiGraphColumn
+}
+
+type uiGraphHeader struct {
+	Name  string
+	Color string
 }
 
 type uiGraphColumn struct {
@@ -63,8 +75,9 @@ type uiGraphColumn struct {
 }
 
 type uiGraphValue struct {
-	Val  float32
-	Hint string
+	Val    float32
+	IsNull bool
+	Hint   string
 }
 
 type uiCrashPageTable struct {
@@ -157,6 +170,63 @@ func handleGraphLifetimes(c context.Context, w http.ResponseWriter, r *http.Requ
 	return serveTemplate(w, "graph_lifetimes.html", data)
 }
 
+// nolint: dupl
+func handleFoundBugsGraph(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	hdr, err := commonHeader(c, r, w, "")
+	if err != nil {
+		return err
+	}
+	bugs, err := loadStableGraphBugs(c, hdr.Namespace)
+	if err != nil {
+		return err
+	}
+	data := &uiHistogramPage{
+		Title:  hdr.Namespace + " bugs found per month",
+		Header: hdr,
+		Graph:  createFoundBugs(c, bugs),
+	}
+	return serveTemplate(w, "graph_histogram.html", data)
+}
+
+func handleCoverageGraph(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	hdr, err := commonHeader(c, r, w, "")
+	if err != nil {
+		return err
+	}
+	yesterday := civil.DateOf(time.Now().Add(-1 * 24 * time.Hour))
+	monthAgo := yesterday.AddDays(-31)
+	hist, err := MergedCoverage(c, hdr.Namespace, monthAgo, yesterday)
+	if err != nil {
+		return err
+	}
+	dates := []string{}
+	for i := 31; i >= 0; i-- {
+		dates = append(dates, yesterday.AddDays(-i).String())
+	}
+	cols := []uiGraphColumn{}
+	for _, date := range dates {
+		if _, ok := hist.covered[date]; !ok || hist.instrumented[date] == 0 {
+			cols = append(cols, uiGraphColumn{Hint: date, Vals: []uiGraphValue{{IsNull: true}}})
+		} else {
+			cols = append(cols, uiGraphColumn{
+				Vals: []uiGraphValue{{Val: float32(hist.covered[date]) / float32(hist.instrumented[date])}},
+				Hint: date,
+			})
+		}
+	}
+	data := &uiHistogramPage{
+		Title:  hdr.Namespace + " coverage",
+		Header: hdr,
+		Graph: &uiGraph{
+			Headers: []uiGraphHeader{
+				{Name: "Total", Color: "Red"},
+			},
+			Columns: cols,
+		},
+	}
+	return serveTemplate(w, "graph_histogram.html", data)
+}
+
 func loadGraphBugs(c context.Context, ns string) ([]*Bug, error) {
 	filter := func(query *db.Query) *db.Query {
 		return query.Filter("Namespace=", ns)
@@ -170,7 +240,8 @@ func loadGraphBugs(c context.Context, ns string) ([]*Bug, error) {
 	lastReporting := getNsConfig(c, ns).lastActiveReporting()
 	for _, bug := range bugs {
 		if bug.Reporting[lastReporting].Reported.IsZero() {
-			if bug.Status == BugStatusOpen {
+			// Bugs with fixing commits are considered public (see Bug.sanitizeAccess).
+			if bug.Status == BugStatusOpen && len(bug.Commits) == 0 {
 				// These bugs are not released yet.
 				continue
 			}
@@ -194,6 +265,58 @@ func loadGraphBugs(c context.Context, ns string) ([]*Bug, error) {
 		n++
 	}
 	return bugs[:n], nil
+}
+
+// loadStableGraphBugs is similar to loadGraphBugs, but it does not remove duplicates and auto-invalidated bugs.
+// This ensures that the set of bugs does not change much over time.
+func loadStableGraphBugs(c context.Context, ns string) ([]*Bug, error) {
+	filter := func(query *db.Query) *db.Query {
+		return query.Filter("Namespace=", ns)
+	}
+	bugs, _, err := loadAllBugs(c, filter)
+	if err != nil {
+		return nil, err
+	}
+	n := 0
+	lastReporting := getNsConfig(c, ns).lastActiveReporting()
+	for _, bug := range bugs {
+		if isStableBug(c, bug, lastReporting) {
+			bugs[n] = bug
+			n++
+		}
+	}
+	return bugs[:n], nil
+}
+
+func isStableBug(c context.Context, bug *Bug, lastReporting int) bool {
+	// Bugs with fixing commits are considered public (see Bug.sanitizeAccess).
+	if !bug.Reporting[lastReporting].Reported.IsZero() ||
+		bug.Status == BugStatusFixed || len(bug.Commits) != 0 {
+		return true
+	}
+	// Invalid/dup not in the final reporting.
+	if bug.Status != BugStatusOpen {
+		return false
+	}
+	// The bug is still open, but not in the final reporting.
+	// Check if it's delayed from reaching the final reporting only by embargo.
+	for i := range bug.Reporting {
+		if i == lastReporting {
+			return true
+		}
+		if !bug.Reporting[i].Closed.IsZero() {
+			continue
+		}
+		reporting := getNsConfig(c, bug.Namespace).ReportingByName(bug.Reporting[i].Name)
+		if !bug.Reporting[i].Reported.IsZero() && reporting.Embargo != 0 {
+			continue
+		}
+		if reporting.Filter(bug) == FilterSkip {
+			continue
+		}
+		return false
+	}
+	return false
 }
 
 func createBugsGraph(c context.Context, bugs []*Bug) *uiGraph {
@@ -262,7 +385,78 @@ func createBugsGraph(c context.Context, bugs []*Bug) *uiGraph {
 		columns = append(columns, col)
 	}
 	return &uiGraph{
-		Headers: []string{"open bugs", "total reported", "total fixed"},
+		Headers: []uiGraphHeader{{Name: "open bugs"}, {Name: "total reported"}, {Name: "total fixed"}},
+		Columns: columns,
+	}
+}
+
+func createFoundBugs(c context.Context, bugs []*Bug) *uiGraph {
+	const projected = "projected"
+	// This is linux-specific at the moment, potentially can move to pkg/report/crash
+	// and extend to other OSes.
+	// nolint: lll
+	types := []struct {
+		name  string
+		color string
+		re    *regexp.Regexp
+	}{
+		{"KASAN", "Red", regexp.MustCompile(`^KASAN:`)},
+		{"KMSAN", "Gold", regexp.MustCompile(`^KMSAN:`)},
+		{"KCSAN", "Fuchsia", regexp.MustCompile(`^KCSAN:`)},
+		{"mem safety", "OrangeRed", regexp.MustCompile(`^(WARNING: refcount bug|UBSAN: array-index|BUG: corrupted list|BUG: unable to handle kernel paging request)`)},
+		{"mem leak", "MediumSeaGreen", regexp.MustCompile(`^memory leak`)},
+		{"locking", "DodgerBlue", regexp.MustCompile(`^(BUG: sleeping function|BUG: spinlock recursion|BUG: using ([a-z_]+)\\(\\) in preemptible|inconsistent lock state|WARNING: still has locks held|possible deadlock|WARNING: suspicious RCU usage)`)},
+		{"hangs/stalls", "LightSalmon", regexp.MustCompile(`^(BUG: soft lockup|INFO: rcu .* stall|INFO: task hung)`)},
+		// This must be at the end, otherwise "BUG:" will match other error types.
+		{"DoS", "Violet", regexp.MustCompile(`^(BUG:|kernel BUG|divide error|Internal error in|kernel panic:|general protection fault)`)},
+		{"other", "Gray", regexp.MustCompile(`.*`)},
+		{projected, "LightGray", nil},
+	}
+	var sorted []time.Time
+	months := make(map[time.Time]map[string]int)
+	for _, bug := range bugs {
+		for _, typ := range types {
+			if !typ.re.MatchString(bug.Title) {
+				continue
+			}
+			t := bug.FirstTime
+			m := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+			if months[m] == nil {
+				months[m] = make(map[string]int)
+				sorted = append(sorted, m)
+			}
+			months[m][typ.name]++
+			break
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Before(sorted[j])
+	})
+	now := timeNow(c)
+	thisMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if m := months[thisMonth]; m != nil {
+		total := 0
+		for _, c := range m {
+			total += c
+		}
+		nextMonth := thisMonth.AddDate(0, 1, 0)
+		m[projected] = int(float64(total) / float64(now.Sub(thisMonth)) * float64(nextMonth.Sub(now)))
+	}
+	var headers []uiGraphHeader
+	for _, typ := range types {
+		headers = append(headers, uiGraphHeader{Name: typ.name, Color: typ.color})
+	}
+	var columns []uiGraphColumn
+	for _, month := range sorted {
+		col := uiGraphColumn{Hint: month.Format("Jan-06")}
+		stats := months[month]
+		for _, typ := range types {
+			col.Vals = append(col.Vals, uiGraphValue{Val: float32(stats[typ.name])})
+		}
+		columns = append(columns, col)
+	}
+	return &uiGraph{
+		Headers: headers,
 		Columns: columns,
 	}
 }
@@ -270,39 +464,50 @@ func createBugsGraph(c context.Context, bugs []*Bug) *uiGraph {
 func createBugLifetimes(c context.Context, bugs []*Bug, causeBisects map[string]*Job) []uiBugLifetime {
 	var res []uiBugLifetime
 	for i, bug := range bugs {
-		ui := uiBugLifetime{
-			// TODO: this is not the time when it was reported to the final reporting.
-			Reported: bug.FirstTime,
-		}
 		if bug.Status >= BugStatusInvalid {
 			continue
 		}
+		reported := bug.FirstTime
+		// Find reporting date to the last reporting stage (where it was reported),
+		// it's a more meaningful date b/c the bug could not be fixed before that.
+		for _, reporting := range bug.Reporting {
+			if reported.Before(reporting.Reported) {
+				reported = reporting.Reported
+			}
+		}
+		ui := uiBugLifetime{}
 		fixed := bug.FixTime
 		if fixed.IsZero() || bug.Status == BugStatusFixed && bug.Closed.Before(fixed) {
 			fixed = bug.Closed
 		}
+		fixedDaysAgo := max(0, float32(fixed.Sub(reported))/float32(24*time.Hour))
 		if !fixed.IsZero() {
-			days := float32(fixed.Sub(ui.Reported)) / float32(24*time.Hour)
-			if days > 365 {
+			// We use fixed date as the X coordiate (date) for fixed bugs to show
+			// how lifetime of bugs fixed at the given date (e.g. lately).
+			ui.Reported = fixed
+			if fixedDaysAgo > 365 {
+				// Cap Y coordinate to 365 to make Y coordinates with the first year
+				// distinguishable in presence of very large Y coordinates
+				// (e.g. if something was fixed/introduced in 5 years).
+				// Add small jitter to min/max values to make close dots distinguishable.
 				ui.Fixed1y = 365 + float32(i%7)
 			} else {
-				if days <= 0 {
-					days = 0.1
-				}
-				ui.Fixed = days
+				ui.Fixed = max(0.2*(1+float32(i%5)), fixedDaysAgo)
 			}
 		} else {
-			ui.NotFixed = 400 - float32(i%7)
+			ui.Reported = reported
+			ui.NotFixed = 400 - float32(i%10)
+		}
+		res = append(res, ui)
+		ui = uiBugLifetime{
+			Reported: reported,
 		}
 		if job := causeBisects[bug.keyHash(c)]; job != nil {
 			days := float32(job.Commits[0].Date.Sub(ui.Reported)) / float32(24*time.Hour)
 			if days < -365 {
 				ui.Introduced1y = -365 - float32(i%7)
 			} else {
-				if days >= 0 {
-					days = -0.1
-				}
-				ui.Introduced = days
+				ui.Introduced = min(-0.2*(1+float32(i%5)), days)
 			}
 		}
 		res = append(res, ui)
@@ -328,7 +533,7 @@ func handleGraphFuzzing(c context.Context, w http.ResponseWriter, r *http.Reques
 	metrics, err := createCheckBox(r, "Metrics", []string{
 		"MaxCorpus", "MaxCover", "MaxPCs", "TotalFuzzingTime",
 		"TotalCrashes", "CrashTypes", "SuppressedCrashes", "TotalExecs",
-		"ExecsPerSec"})
+		"ExecsPerSec", "TriagedPCs", "TriagedCoverage"})
 	if err != nil {
 		return err
 	}
@@ -349,7 +554,7 @@ func createManagersGraph(c context.Context, ns string, selManagers, selMetrics [
 	graph := &uiGraph{}
 	for _, mgr := range selManagers {
 		for _, metric := range selMetrics {
-			graph.Headers = append(graph.Headers, mgr+"-"+metric)
+			graph.Headers = append(graph.Headers, uiGraphHeader{Name: mgr + "-" + metric})
 		}
 	}
 	now := timeNow(c)
@@ -381,10 +586,11 @@ func createManagersGraph(c context.Context, ns string, selManagers, selMetrics [
 				continue
 			}
 			for metricIndex, metric := range selMetrics {
-				val := extractMetric(stat, metric)
+				val, canBeZero := extractMetric(stat, metric)
 				graph.Columns[dayIndex].Vals[mgrIndex*len(selMetrics)+metricIndex] = uiGraphValue{
-					Val:  float32(val),
-					Hint: fmt.Sprintf("%.2f", val),
+					Val:    float32(val),
+					IsNull: !canBeZero && val == 0,
+					Hint:   fmt.Sprintf("%.2f", val),
 				}
 			}
 		}
@@ -398,7 +604,11 @@ func createManagersGraph(c context.Context, ns string, selManagers, selMetrics [
 			max := float32(1)
 			for col := range graph.Columns {
 				for mgrIndex := range selManagers {
-					val := graph.Columns[col].Vals[mgrIndex*len(selMetrics)+metricIndex].Val
+					item := graph.Columns[col].Vals[mgrIndex*len(selMetrics)+metricIndex]
+					if item.IsNull {
+						continue
+					}
+					val := item.Val
 					if max < val {
 						max = val
 					}
@@ -414,30 +624,34 @@ func createManagersGraph(c context.Context, ns string, selManagers, selMetrics [
 	return graph, nil
 }
 
-func extractMetric(stat *ManagerStats, metric string) float64 {
+func extractMetric(stat *ManagerStats, metric string) (val float64, canBeZero bool) {
 	switch metric {
 	case "MaxCorpus":
-		return float64(stat.MaxCorpus)
+		return float64(stat.MaxCorpus), false
 	case "MaxCover":
-		return float64(stat.MaxCover)
+		return float64(stat.MaxCover), false
 	case "MaxPCs":
-		return float64(stat.MaxPCs)
+		return float64(stat.MaxPCs), false
 	case "TotalFuzzingTime":
-		return float64(stat.TotalFuzzingTime)
+		return float64(stat.TotalFuzzingTime), true
 	case "TotalCrashes":
-		return float64(stat.TotalCrashes)
+		return float64(stat.TotalCrashes), true
 	case "CrashTypes":
-		return float64(stat.CrashTypes)
+		return float64(stat.CrashTypes), true
 	case "SuppressedCrashes":
-		return float64(stat.SuppressedCrashes)
+		return float64(stat.SuppressedCrashes), true
 	case "TotalExecs":
-		return float64(stat.TotalExecs)
+		return float64(stat.TotalExecs), true
 	case "ExecsPerSec":
 		timeSec := float64(stat.TotalFuzzingTime) / 1e9
 		if timeSec == 0 {
-			return 0
+			return 0, true
 		}
-		return float64(stat.TotalExecs) / timeSec
+		return float64(stat.TotalExecs) / timeSec, true
+	case "TriagedCoverage":
+		return float64(stat.TriagedCoverage), false
+	case "TriagedPCs":
+		return float64(stat.TriagedPCs), false
 	default:
 		panic(fmt.Sprintf("unknown metric %q", metric))
 	}
@@ -582,7 +796,10 @@ func createCrashesTable(c context.Context, ns string, days int, bugs []*Bug) *ui
 
 func createCrashesGraph(c context.Context, ns string, regexps []string, days int, bugs []*Bug) (*uiGraph, error) {
 	const dayDuration = 24 * time.Hour
-	graph := &uiGraph{Headers: regexps}
+	graph := &uiGraph{}
+	for _, re := range regexps {
+		graph.Headers = append(graph.Headers, uiGraphHeader{Name: re})
+	}
 	startDay := timeNow(c).Add(time.Duration(-days) * dayDuration)
 	// Step 1: fill the whole table with empty values.
 	dateToIdx := make(map[int]int)

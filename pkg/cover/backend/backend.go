@@ -6,33 +6,27 @@ package backend
 import (
 	"fmt"
 
-	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/sys/targets"
 )
 
 type Impl struct {
-	Units     []*CompileUnit
-	Symbols   []*Symbol
-	Frames    []Frame
-	Symbolize func(pcs map[*Module][]uint64) ([]Frame, error)
-	RestorePC func(pc uint32) uint64
-}
-
-type Module struct {
-	Name string
-	Path string
-	Addr uint64
+	Units           []*CompileUnit
+	Symbols         []*Symbol
+	Frames          []Frame
+	Symbolize       func(pcs map[*KernelModule][]uint64) ([]Frame, error)
+	CallbackPoints  []uint64
+	PreciseCoverage bool
 }
 
 type CompileUnit struct {
 	ObjectUnit
 	Path   string
-	Module *Module
+	Module *KernelModule
 }
 
 type Symbol struct {
 	ObjectUnit
-	Module     *Module
+	Module     *KernelModule
 	Unit       *CompileUnit
 	Start      uint64
 	End        uint64
@@ -47,10 +41,12 @@ type ObjectUnit struct {
 }
 
 type Frame struct {
-	Module *Module
-	PC     uint64
-	Name   string
-	Path   string
+	Module   *KernelModule
+	PC       uint64
+	Name     string
+	FuncName string
+	Path     string
+	Inline   bool
 	Range
 }
 
@@ -63,16 +59,23 @@ type Range struct {
 
 const LineEnd = 1 << 30
 
-func Make(target *targets.Target, vm, objDir, srcDir, buildDir string,
-	moduleObj []string, modules []host.KernelModule) (*Impl, error) {
+func Make(target *targets.Target, vm, objDir, srcDir, buildDir string, splitBuild bool,
+	moduleObj []string, modules []*KernelModule) (*Impl, error) {
 	if objDir == "" {
 		return nil, fmt.Errorf("kernel obj directory is not specified")
 	}
-	if target.OS == "darwin" {
+	if target.OS == targets.Darwin {
 		return makeMachO(target, objDir, srcDir, buildDir, moduleObj, modules)
 	}
-	if vm == "gvisor" {
+	if vm == targets.GVisor {
 		return makeGvisor(target, objDir, srcDir, buildDir, modules)
 	}
-	return makeELF(target, objDir, srcDir, buildDir, moduleObj, modules)
+	var delimiters []string
+	if splitBuild {
+		// Path prefixes used by Android Pixel kernels. See
+		// https://source.android.com/docs/setup/build/building-pixel-kernels for more
+		// details.
+		delimiters = []string{"/aosp/", "/private/"}
+	}
+	return makeELF(target, objDir, srcDir, buildDir, delimiters, moduleObj, modules)
 }

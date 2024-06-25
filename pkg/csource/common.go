@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/syzkaller/executor"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
@@ -35,7 +36,7 @@ func createCommonHeader(p, mmapProg *prog.Prog, replacements map[string]string, 
 	for _, def := range defines {
 		cmd.Args = append(cmd.Args, "-D"+def)
 	}
-	cmd.Stdin = strings.NewReader(commonHeader)
+	cmd.Stdin = bytes.NewReader(executor.CommonHeader)
 	stderr := new(bytes.Buffer)
 	stdout := new(bytes.Buffer)
 	cmd.Stderr = stderr
@@ -122,13 +123,11 @@ func commonDefines(p *prog.Prog, opts Options) map[string]bool {
 		"SYZ_VHCI_INJECTION":            opts.VhciInjection,
 		"SYZ_USE_TMP_DIR":               opts.UseTmpDir,
 		"SYZ_HANDLE_SEGV":               opts.HandleSegv,
-		"SYZ_REPRO":                     opts.Repro,
 		"SYZ_TRACE":                     opts.Trace,
 		"SYZ_WIFI":                      opts.Wifi,
 		"SYZ_802154":                    opts.IEEE802154,
 		"SYZ_SYSCTL":                    opts.Sysctl,
 		"SYZ_SWAP":                      opts.Swap,
-		"SYZ_EXECUTOR_USES_SHMEM":       sysTarget.ExecutorUsesShmem,
 		"SYZ_EXECUTOR_USES_FORK_SERVER": sysTarget.ExecutorUsesForkServer,
 	}
 }

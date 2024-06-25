@@ -4,12 +4,14 @@
 package starnix
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,12 +19,13 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 func init() {
 	var _ vmimpl.Infoer = (*instance)(nil)
-	vmimpl.Register("starnix", ctor, true)
+	vmimpl.Register(targets.Starnix, ctor, true)
 }
 
 type Config struct {
@@ -46,16 +49,17 @@ type instance struct {
 	debug            bool
 	workdir          string
 	port             int
+	forwardPort      int
 	rpipe            io.ReadCloser
 	wpipe            io.WriteCloser
 	fuchsiaLogs      *exec.Cmd
-	adb              *exec.Cmd
-	executor         string
+	sshPubKey        string
+	sshPrivKey       string
 	merger           *vmimpl.OutputMerger
 	diagnose         chan bool
 }
 
-const targetDir = "/data"
+const targetDir = "/tmp"
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{}
@@ -64,9 +68,6 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	}
 	if cfg.Count < 1 || cfg.Count > 128 {
 		return nil, fmt.Errorf("invalid config param count: %v, want [1, 128]", cfg.Count)
-	}
-	if _, err := exec.LookPath("adb"); err != nil {
-		return nil, err
 	}
 
 	pool := &Pool{
@@ -89,8 +90,6 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		cfg:              pool.cfg,
 		debug:            pool.env.Debug,
 		workdir:          workdir,
-		// This file is auto-generated inside createAdbScript.
-		executor: filepath.Join(workdir, "adb_executor.sh"),
 	}
 	closeInst := inst
 	defer func() {
@@ -116,6 +115,16 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 			inst.fuchsiaDirectory,
 			err)
 	}
+	pubkey, err := osutil.RunCmd(30*time.Second, inst.fuchsiaDirectory, inst.ffxBinary, "config", "get", "ssh.pub")
+	if err != nil {
+		return nil, err
+	}
+	inst.sshPubKey = string(bytes.Trim(pubkey, "\"\n"))
+	privkey, err := osutil.RunCmd(30*time.Second, inst.fuchsiaDirectory, inst.ffxBinary, "config", "get", "ssh.priv")
+	if err != nil {
+		return nil, err
+	}
+	inst.sshPrivKey = string(bytes.Trim(privkey, "\"\n"))
 
 	if err := inst.boot(); err != nil {
 		return nil, err
@@ -128,30 +137,30 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 func (inst *instance) boot() error {
 	inst.port = vmimpl.UnusedTCPPort()
 	// Start output merger.
-	inst.merger = vmimpl.NewOutputMerger(nil)
+	var tee io.Writer
+	if inst.debug {
+		tee = os.Stdout
+	}
+	inst.merger = vmimpl.NewOutputMerger(tee)
 
 	inst.ffx("doctor", "--restart-daemon")
 
 	inst.ffx("emu", "stop", inst.name)
 
 	if err := inst.startFuchsiaVM(); err != nil {
-		return fmt.Errorf("could not start Fuchsia VM: %w", err)
+		return fmt.Errorf("instance %s: could not start Fuchsia VM: %w", inst.name, err)
 	}
-
-	if err := inst.startAdbServerAndConnection(1 * time.Minute); err != nil {
-		return fmt.Errorf("could not start and connect to the adb server: %w", err)
-	}
-
-	if err := inst.createAdbScript(); err != nil {
-		return fmt.Errorf("could not create adb script: %w", err)
-	}
-
-	err := inst.startFuchsiaLogs()
-	if err != nil {
-		return fmt.Errorf("could not start fuchsia logs: %w", err)
+	if err := inst.startSshdAndConnect(); err != nil {
+		return fmt.Errorf("instance %s: could not start sshd: %w", inst.name, err)
 	}
 	if inst.debug {
-		log.Logf(0, "%s booted successfully", inst.name)
+		log.Logf(0, "instance %s: setting up...", inst.name)
+	}
+	if err := inst.startFuchsiaLogs(); err != nil {
+		return fmt.Errorf("instance %s: could not start fuchsia logs: %w", inst.name, err)
+	}
+	if inst.debug {
+		log.Logf(0, "instance %s: booted successfully", inst.name)
 	}
 	return nil
 }
@@ -161,10 +170,6 @@ func (inst *instance) Close() {
 	if inst.fuchsiaLogs != nil {
 		inst.fuchsiaLogs.Process.Kill()
 		inst.fuchsiaLogs.Wait()
-	}
-	if inst.adb != nil {
-		inst.adb.Process.Kill()
-		inst.adb.Wait()
 	}
 	if inst.merger != nil {
 		inst.merger.Wait()
@@ -178,7 +183,7 @@ func (inst *instance) Close() {
 }
 
 func (inst *instance) startFuchsiaVM() error {
-	err := inst.ffx("emu", "start", "--headless", "--name", inst.name)
+	err := inst.ffx("emu", "start", "--headless", "--name", inst.name, "--net", "user")
 	if err != nil {
 		return err
 	}
@@ -189,7 +194,8 @@ func (inst *instance) startFuchsiaLogs() error {
 	// `ffx log` outputs some buffered logs by default, and logs from early boot
 	// trigger a false positive from the unexpected reboot check. To avoid this,
 	// only request logs from now on.
-	cmd := osutil.Command(inst.ffxBinary, "--target", inst.name, "log", "--since", "now")
+	cmd := osutil.Command(inst.ffxBinary, "--target", inst.name, "log", "--since", "now",
+		"--show-metadata", "--show-full-moniker", "--no-color")
 	cmd.Dir = inst.fuchsiaDirectory
 	cmd.Stdout = inst.wpipe
 	cmd.Stderr = inst.wpipe
@@ -203,54 +209,95 @@ func (inst *instance) startFuchsiaLogs() error {
 	return nil
 }
 
-func (inst *instance) startAdbServerAndConnection(timeout time.Duration) error {
-	cmd := osutil.Command(inst.ffxBinary, "--target", inst.name, "starnix", "adb",
-		"-p", fmt.Sprintf("%d", inst.port))
+func (inst *instance) startSshdAndConnect() error {
+	cmd := osutil.Command(
+		inst.ffxBinary,
+		"--target",
+		inst.name,
+		"component",
+		"run",
+		"/core/starnix_runner/playground:alpine",
+		"fuchsia-pkg://fuchsia.com/syzkaller_starnix#meta/alpine_container.cm",
+	)
 	cmd.Dir = inst.fuchsiaDirectory
-	if err := cmd.Start(); err != nil {
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
 		return err
 	}
 	if inst.debug {
-		log.Logf(0, fmt.Sprintf("the adb bridge is listening on 127.0.0.1:%d", inst.port))
+		log.Logf(1, "instance %s: started alpine container", inst.name)
 	}
-	inst.adb = cmd
-	return inst.connectToAdb(timeout)
+	cmd = osutil.Command(inst.ffxBinary,
+		"--target",
+		inst.name,
+		"component",
+		"run",
+		"/core/starnix_runner/playground:alpine/daemons:start_sshd",
+		"fuchsia-pkg://fuchsia.com/syzkaller_starnix#meta/start_sshd.cm",
+	)
+	cmd.Dir = inst.fuchsiaDirectory
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	if inst.debug {
+		log.Logf(1, "instance %s: started sshd on alpine container", inst.name)
+	}
+	cmd = osutil.Command(
+		inst.ffxBinary,
+		"--target",
+		inst.name,
+		"component",
+		"copy",
+		inst.sshPubKey,
+		"/core/starnix_runner/playground:alpine::out::fs_root/tmp/authorized_keys",
+	)
+	cmd.Dir = inst.fuchsiaDirectory
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	if inst.debug {
+		log.Logf(0, "instance %s: copied ssh key", inst.name)
+	}
+	return inst.connect()
 }
 
-func (inst *instance) connectToAdb(timeout time.Duration) error {
-	startTime := time.Now()
-	for {
-		vmimpl.SleepInterruptible(3 * time.Second)
-		if inst.debug {
-			log.Logf(0, "attempting to connect to ADB")
-		}
-		connectOutput, err := osutil.RunCmd(
-			2*time.Minute,
-			inst.fuchsiaDirectory,
-			"adb",
-			"connect",
-			fmt.Sprintf("127.0.0.1:%d", inst.port))
-		if err == nil && strings.HasPrefix(string(connectOutput), "connected to") {
-			return nil
-		}
-		inst.runCommand("adb", "disconnect", fmt.Sprintf("127.0.0.1:%d", inst.port))
-		if inst.debug {
-			log.Logf(0, "adb connect failed")
-		}
-		if time.Since(startTime) > timeout {
-			return fmt.Errorf("can't connect to ADB server")
-		}
+func (inst *instance) connect() error {
+	if inst.debug {
+		log.Logf(1, "instance %s: attempting to connect to starnix container over ssh", inst.name)
 	}
-}
-
-// Script for telling syz-fuzzer how to connect to syz-executor.
-func (inst *instance) createAdbScript() error {
-	adbScript := fmt.Sprintf(
-		`#!/usr/bin/env bash
-		adb_port=$1
-		fuzzer_args=${@:2}
-		exec adb -s 127.0.0.1:$adb_port shell "cd %s; ./syz-executor $fuzzer_args"`, targetDir)
-	return os.WriteFile(inst.executor, []byte(adbScript), 0777)
+	address, err := osutil.RunCmd(
+		30*time.Second,
+		inst.fuchsiaDirectory,
+		inst.ffxBinary,
+		"--target",
+		inst.name,
+		"target",
+		"get-ssh-address")
+	if err != nil {
+		return err
+	}
+	if inst.debug {
+		log.Logf(0, fmt.Sprintf("instance %s: the fuchsia instance's address is %s", inst.name, address))
+	}
+	cmd := osutil.Command(
+		"ssh",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-i", inst.sshPrivKey,
+		"-NT",
+		"-L", fmt.Sprintf("localhost:%d:localhost:7000", inst.port), fmt.Sprintf("ssh://%s", bytes.Trim(address, "\n")),
+	)
+	cmd.Stderr = os.Stderr
+	if err = cmd.Start(); err != nil {
+		return err
+	}
+	time.Sleep(5 * time.Second)
+	if inst.debug {
+		log.Logf(0, "instance %s: forwarded port from starnix container", inst.name)
+	}
+	return nil
 }
 
 func (inst *instance) ffx(args ...string) error {
@@ -260,11 +307,11 @@ func (inst *instance) ffx(args ...string) error {
 // Runs a command inside the fuchsia directory.
 func (inst *instance) runCommand(cmd string, args ...string) error {
 	if inst.debug {
-		log.Logf(0, "running command: %s %q", cmd, args)
+		log.Logf(1, "instance %s: running command: %s %q", inst.name, cmd, args)
 	}
 	output, err := osutil.RunCmd(5*time.Minute, inst.fuchsiaDirectory, cmd, args...)
 	if inst.debug {
-		log.Logf(0, "%s", output)
+		log.Logf(1, "instance %s: %s", inst.name, output)
 	}
 	return err
 }
@@ -273,24 +320,32 @@ func (inst *instance) Forward(port int) (string, error) {
 	if port == 0 {
 		return "", fmt.Errorf("vm/starnix: forward port is zero")
 	}
+	if inst.forwardPort != 0 {
+		return "", fmt.Errorf("vm/starnix: forward port already set")
+	}
+	inst.forwardPort = port
 	return fmt.Sprintf("localhost:%v", port), nil
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDst := filepath.Join(targetDir, base)
-	if base == "syz-fuzzer" || base == "syz-execprog" {
-		return hostSrc, nil // we will run these on host.
+	if inst.debug {
+		log.Logf(1, "instance %s: attempting to push binary %s to instance over scp", inst.name, base)
 	}
-
 	err := inst.runCommand(
-		"adb",
-		"-s",
-		fmt.Sprintf("127.0.0.1:%d", inst.port),
-		"push",
+		"scp",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-i", inst.sshPrivKey,
+		"-P", strconv.Itoa(inst.port),
 		hostSrc,
-		vmDst)
-	return vmDst, err
+		fmt.Sprintf("root@localhost:%s", vmDst),
+	)
+	if err == nil {
+		return vmDst, err
+	}
+	return vmDst, fmt.Errorf("instance %s: can't push binary %s to instance over scp", inst.name, base)
 }
 
 func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
@@ -299,22 +354,19 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	if err != nil {
 		return nil, nil, err
 	}
-	inst.merger.Add("adb", rpipe)
+	inst.merger.Add("ssh", rpipe)
 
-	args := strings.Split(command, " ")
-	if bin := filepath.Base(args[0]); bin == "syz-fuzzer" || bin == "syz-execprog" {
-		for i, arg := range args {
-			if strings.HasPrefix(arg, "-executor=") {
-				args[i] = fmt.Sprintf("-executor=%s %d", inst.executor, inst.port)
-				// TODO(fxbug.dev/120202): reenable threaded mode once clone3 is fixed.
-				args = append(args, "-threaded=0")
-			}
-		}
-	}
+	// Run `command` on the instance over ssh.
+	const useSystemSSHCfg = false
+	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshPrivKey, inst.port, inst.forwardPort, useSystemSSHCfg)
+	sshCmd := []string{"ssh"}
+	sshCmd = append(sshCmd, sshArgs...)
+	sshCmd = append(sshCmd, "root@localhost", "cd "+targetDir+" && ", command)
 	if inst.debug {
-		log.Logf(0, "running command: %#v", args)
+		log.Logf(1, "instance %s: running command: %#v", inst.name, sshCmd)
 	}
-	cmd := osutil.Command(args[0], args[1:]...)
+
+	cmd := osutil.Command(sshCmd[0], sshCmd[1:]...)
 	cmd.Dir = inst.workdir
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe

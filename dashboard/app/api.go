@@ -6,9 +6,11 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -26,10 +28,10 @@ import (
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/sys/targets"
-	"golang.org/x/net/context"
 	"google.golang.org/appengine/v2"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
+	"google.golang.org/appengine/v2/user"
 )
 
 func initAPIHandlers() {
@@ -65,6 +67,7 @@ var apiNamespaceHandlers = map[string]APINamespaceHandler{
 	"load_bug":            apiLoadBug,
 	"update_report":       apiUpdateReport,
 	"add_build_assets":    apiAddBuildAssets,
+	"log_to_repro":        apiLogToReproduce,
 }
 
 type JSONHandler func(c context.Context, r *http.Request) (interface{}, error)
@@ -260,7 +263,38 @@ func apiCommitPoll(c context.Context, ns string, r *http.Request, payload []byte
 	for com := range commits {
 		resp.Commits = append(resp.Commits, com)
 	}
+	if getNsConfig(c, ns).RetestMissingBackports {
+		const takeBackportTitles = 5
+		backportCommits, err := pollBackportCommits(c, ns, takeBackportTitles)
+		if err != nil {
+			return nil, err
+		}
+		resp.Commits = append(resp.Commits, backportCommits...)
+	}
 	return resp, nil
+}
+
+func pollBackportCommits(c context.Context, ns string, count int) ([]string, error) {
+	// Let's assume that there won't be too many pending backports.
+	bugs, jobs, _, err := relevantBackportJobs(c)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query backport: %w", err)
+	}
+	var backportTitles []string
+	for i, bug := range bugs {
+		if bug.Namespace != ns {
+			continue
+		}
+		backportTitles = append(backportTitles, jobs[i].Commits[0].Title)
+	}
+	randomizer := rand.New(rand.NewSource(timeNow(c).UnixNano()))
+	randomizer.Shuffle(len(backportTitles), func(i, j int) {
+		backportTitles[i], backportTitles[j] = backportTitles[j], backportTitles[i]
+	})
+	if len(backportTitles) > count {
+		backportTitles = backportTitles[:count]
+	}
+	return backportTitles, nil
 }
 
 func apiUploadCommits(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
@@ -280,6 +314,12 @@ func apiUploadCommits(c context.Context, ns string, r *http.Request, payload []b
 		}
 		if err := addCommitInfo(c, ns, com); err != nil {
 			return nil, err
+		}
+	}
+	if getNsConfig(c, ns).RetestMissingBackports {
+		err = updateBackportCommits(c, ns, req.Commits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update backport commits: %w", err)
 		}
 	}
 	return nil, nil
@@ -363,6 +403,10 @@ func addCommitInfoToBugImpl(c context.Context, bug *Bug, com dashapi.Commit) (bo
 }
 
 func apiJobPoll(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
+	if stop, err := emergentlyStopped(c); err != nil || stop {
+		// The bot's operation was aborted. Don't accept new crash reports.
+		return &dashapi.JobPollResp{}, err
+	}
 	req := new(dashapi.JobPollReq)
 	if err := json.Unmarshal(payload, req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
@@ -672,12 +716,12 @@ func apiReportBuildError(c context.Context, ns string, r *http.Request, payload 
 	now := timeNow(c)
 	build, _, err := uploadBuild(c, now, ns, &req.Build, BuildFailed)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to store build: %w", err)
 	}
 	req.Crash.BuildID = req.Build.ID
 	bug, err := reportCrash(c, build, &req.Crash)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to store crash: %w", err)
 	}
 	if err := updateManager(c, ns, req.Build.Manager, func(mgr *Manager, stats *ManagerStats) error {
 		log.Infof(c, "failed build on %v: kernel=%v", req.Build.Manager, req.Build.KernelCommit)
@@ -688,7 +732,7 @@ func apiReportBuildError(c context.Context, ns string, r *http.Request, payload 
 		}
 		return nil
 	}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to update manager: %w", err)
 	}
 	return nil, nil
 }
@@ -699,6 +743,10 @@ const (
 )
 
 func apiReportCrash(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
+	if stop, err := emergentlyStopped(c); err != nil || stop {
+		// The bot's operation was aborted. Don't accept new crash reports.
+		return &dashapi.ReportCrashResp{}, err
+	}
 	req := new(dashapi.Crash)
 	if err := json.Unmarshal(payload, req); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
@@ -710,9 +758,24 @@ func apiReportCrash(c context.Context, ns string, r *http.Request, payload []byt
 	if !getNsConfig(c, ns).TransformCrash(build, req) {
 		return new(dashapi.ReportCrashResp), nil
 	}
+	var bug2 *Bug
+	if req.OriginalTitle != "" {
+		bug2, err = findExistingBugForCrash(c, ns, []string{req.OriginalTitle})
+		if err != nil {
+			return nil, fmt.Errorf("original bug query failed: %w", err)
+		}
+	}
 	bug, err := reportCrash(c, build, req)
 	if err != nil {
 		return nil, err
+	}
+	if bug2 != nil && bug2.Title != bug.Title && len(req.ReproLog) > 0 {
+		// During bug reproduction, we have diverted to another bug.
+		// Let's remember this.
+		err = saveFailedReproLog(c, bug2, build, req.ReproLog)
+		if err != nil {
+			return nil, fmt.Errorf("failed to save failed repro log: %w", err)
+		}
 	}
 	resp := &dashapi.ReportCrashResp{
 		NeedRepro: needRepro(c, bug),
@@ -740,12 +803,12 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 	ns := build.Namespace
 	bug, err := findBugForCrash(c, ns, req.AltTitles)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find bug for the crash: %w", err)
 	}
 	if bug == nil {
 		bug, err = createBugForCrash(c, ns, req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create a bug: %w", err)
 		}
 	}
 
@@ -764,7 +827,7 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		!stringInList(bug.MergedTitles, req.Title)
 	if save {
 		if err := saveCrash(c, ns, req, bug, bugKey, build, assets); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to save the crash: %w", err)
 		}
 	} else {
 		log.Infof(c, "not saving crash for %q", bug.Title)
@@ -822,7 +885,7 @@ func reportCrash(c context.Context, build *Build, req *dashapi.Crash) (*Bug, err
 		return nil
 	}
 	if err := db.RunInTransaction(c, tx, &db.TransactionOptions{XG: true}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("bug updating failed: %w", err)
 	}
 	if save {
 		purgeOldCrashes(c, bug, bugKey)
@@ -898,6 +961,9 @@ func saveCrash(c context.Context, ns string, req *dashapi.Crash, bug *Bug, bugKe
 		return err
 	}
 	if crash.MachineInfo, err = putText(c, ns, textMachineInfo, req.MachineInfo, true); err != nil {
+		return err
+	}
+	if crash.ReproLog, err = putText(c, ns, textReproLog, req.ReproLog, false); err != nil {
 		return err
 	}
 	crash.UpdateReportingPriority(c, build, bug)
@@ -1000,12 +1066,16 @@ func apiReportFailedRepro(c context.Context, ns string, r *http.Request, payload
 	if bug == nil {
 		return nil, fmt.Errorf("%v: can't find bug for crash %q", ns, req.Title)
 	}
-	bugKey := bug.key(c)
 	build, err := loadBuild(c, ns, req.BuildID)
 	if err != nil {
 		return nil, err
 	}
+	return nil, saveFailedReproLog(c, bug, build, req.ReproLog)
+}
+
+func saveFailedReproLog(c context.Context, bug *Bug, build *Build, log []byte) error {
 	now := timeNow(c)
+	bugKey := bug.key(c)
 	tx := func(c context.Context) error {
 		bug := new(Bug)
 		if err := db.Get(c, bugKey, bug); err != nil {
@@ -1013,8 +1083,8 @@ func apiReportFailedRepro(c context.Context, ns string, r *http.Request, payload
 		}
 		bug.NumRepro++
 		bug.LastReproTime = now
-		if len(req.ReproLog) > 0 {
-			err := saveReproLog(c, bug, build, req.ReproLog)
+		if len(log) > 0 {
+			err := saveReproAttempt(c, bug, build, log)
 			if err != nil {
 				return fmt.Errorf("failed to save repro log: %w", err)
 			}
@@ -1024,16 +1094,15 @@ func apiReportFailedRepro(c context.Context, ns string, r *http.Request, payload
 		}
 		return nil
 	}
-	err = db.RunInTransaction(c, tx, &db.TransactionOptions{
+	return db.RunInTransaction(c, tx, &db.TransactionOptions{
 		XG:       true,
 		Attempts: 30,
 	})
-	return nil, err
 }
 
 const maxReproLogs = 5
 
-func saveReproLog(c context.Context, bug *Bug, build *Build, log []byte) error {
+func saveReproAttempt(c context.Context, bug *Bug, build *Build, log []byte) error {
 	var deleteKeys []*db.Key
 	for len(bug.ReproAttempts)+1 > maxReproLogs {
 		deleteKeys = append(deleteKeys,
@@ -1133,6 +1202,12 @@ func apiManagerStats(c context.Context, ns string, r *http.Request, payload []by
 		stats.TotalCrashes += int64(req.Crashes)
 		stats.SuppressedCrashes += int64(req.SuppressedCrashes)
 		stats.TotalExecs += int64(req.Execs)
+		if cur := int64(req.TriagedCoverage); cur > stats.TriagedCoverage {
+			stats.TriagedCoverage = cur
+		}
+		if cur := int64(req.TriagedPCs); cur > stats.TriagedPCs {
+			stats.TriagedPCs = cur
+		}
 		return nil
 	})
 	return nil, err
@@ -1631,4 +1706,146 @@ func apiSaveDiscussion(c context.Context, r *http.Request, payload []byte) (inte
 		return nil, nil
 	}
 	return nil, mergeDiscussion(c, d)
+}
+
+func emergentlyStopped(c context.Context) (bool, error) {
+	keys, err := db.NewQuery("EmergencyStop").
+		Limit(1).
+		KeysOnly().
+		GetAll(c, nil)
+	if err != nil {
+		return false, err
+	}
+	return len(keys) > 0, nil
+}
+
+func recordEmergencyStop(c context.Context) error {
+	key := db.NewKey(c, "EmergencyStop", "all", 0, nil)
+	_, err := db.Put(c, key, &EmergencyStop{
+		Time: timeNow(c),
+		User: user.Current(c).Email,
+	})
+	return err
+}
+
+// Share crash logs for non-reproduced bugs with syz-managers.
+// In future, this can also take care of repro exchange between instances
+// in the place of syz-hub.
+func apiLogToReproduce(c context.Context, ns string, r *http.Request, payload []byte) (interface{}, error) {
+	req := new(dashapi.LogToReproReq)
+	if err := json.Unmarshal(payload, req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
+	}
+	build, err := loadBuild(c, ns, req.BuildID)
+	if err != nil {
+		return nil, err
+	}
+	// First check if there have been any manual requests.
+	log, err := takeReproTask(c, ns, build.Manager)
+	if err != nil {
+		return nil, err
+	}
+	if log != nil {
+		return &dashapi.LogToReproResp{
+			CrashLog: log,
+		}, nil
+	}
+
+	bugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
+		return query.Filter("Namespace=", ns).
+			Filter("HappenedOn=", build.Manager).
+			Filter("Status=", BugStatusOpen)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query bugs: %w", err)
+	}
+	rand.New(rand.NewSource(timeNow(c).UnixNano())).Shuffle(len(bugs), func(i, j int) {
+		bugs[i], bugs[j] = bugs[j], bugs[i]
+	})
+	// Let's limit the load on the DB.
+	const bugsToConsider = 10
+	checkedBugs := 0
+	for _, bug := range bugs {
+		if bug.ReproLevel != ReproLevelNone {
+			continue
+		}
+		if len(bug.Commits) > 0 || len(bug.ReproAttempts) > 0 {
+			// For now let's focus on all bugs where we have never ever
+			// finished a bug reproduction process.
+			continue
+		}
+		checkedBugs++
+		if checkedBugs > bugsToConsider {
+			break
+		}
+		resp, err := logToReproForBug(c, bug, build.Manager)
+		if resp != nil || err != nil {
+			return resp, err
+		}
+	}
+	return nil, nil
+}
+
+func logToReproForBug(c context.Context, bug *Bug, manager string) (*dashapi.LogToReproResp, error) {
+	const considerCrashes = 10
+	crashes, _, err := queryCrashesForBug(c, bug.key(c), considerCrashes)
+	if err != nil {
+		return nil, err
+	}
+	for _, crash := range crashes {
+		if crash.Manager != manager {
+			continue
+		}
+		crashLog, _, err := getText(c, textCrashLog, crash.Log)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query a crash log: %w", err)
+		}
+		return &dashapi.LogToReproResp{
+			Title:    bug.Title,
+			CrashLog: crashLog,
+		}, nil
+	}
+	return nil, nil
+}
+
+func saveReproTask(c context.Context, ns, manager string, repro []byte) error {
+	log, err := putText(c, ns, textCrashLog, repro, false)
+	if err != nil {
+		return err
+	}
+	// We don't control the status of each attempt, so let's just try twice.
+	const attempts = 2
+	obj := &ReproTask{
+		Namespace:    ns,
+		Manager:      manager,
+		Log:          log,
+		AttemptsLeft: attempts,
+	}
+	key := db.NewIncompleteKey(c, "ReproTask", nil)
+	_, err = db.Put(c, key, obj)
+	return err
+}
+
+func takeReproTask(c context.Context, ns, manager string) ([]byte, error) {
+	var tasks []*ReproTask
+	keys, err := db.NewQuery("ReproTask").
+		Filter("Namespace=", ns).
+		Filter("Manager=", manager).
+		Filter("AttemptsLeft>", 0).
+		GetAll(c, &tasks)
+	if err != nil || len(keys) == 0 {
+		return nil, err
+	}
+
+	// Yes, it's possible that the entity will be modified simultaneously, and we
+	// ideall need a transaction, but let's just ignore this possibility  -- in the
+	// worst case we'd just try to reproduce it once more.
+	key, task := keys[0], tasks[0]
+	task.AttemptsLeft--
+	task.LastAttempt = timeNow(c)
+	if _, err := db.Put(c, key, task); err != nil {
+		return nil, err
+	}
+	log, _, err := getText(c, textCrashLog, task.Log)
+	return log, err
 }

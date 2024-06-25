@@ -11,19 +11,27 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/sys/targets"
 )
 
-func discoverModules(target *targets.Target, objDir string, moduleObj []string, hostModules []host.KernelModule) (
-	[]*Module, error) {
-	modules := []*Module{
+type KernelModule struct {
+	Name string
+	Addr uint64
+	Size uint64
+	Path string
+}
+
+func discoverModules(target *targets.Target, objDir string, moduleObj []string,
+	hostModules []*KernelModule) (
+	[]*KernelModule, error) {
+	modules := []*KernelModule{
 		// A dummy module representing the kernel itself.
 		{Path: filepath.Join(objDir, target.KernelObject)},
 	}
 	if target.OS == targets.Linux {
-		modules1, err := discoverModulesLinux(append([]string{objDir}, moduleObj...), hostModules)
+		modules1, err := discoverModulesLinux(append([]string{objDir}, moduleObj...),
+			hostModules)
 		if err != nil {
 			return nil, err
 		}
@@ -34,12 +42,12 @@ func discoverModules(target *targets.Target, objDir string, moduleObj []string, 
 	return modules, nil
 }
 
-func discoverModulesLinux(dirs []string, hostModules []host.KernelModule) ([]*Module, error) {
+func discoverModulesLinux(dirs []string, hostModules []*KernelModule) ([]*KernelModule, error) {
 	paths, err := locateModules(dirs)
 	if err != nil {
 		return nil, err
 	}
-	var modules []*Module
+	var modules []*KernelModule
 	for _, mod := range hostModules {
 		path := paths[mod.Name]
 		if path == "" {
@@ -47,7 +55,7 @@ func discoverModulesLinux(dirs []string, hostModules []host.KernelModule) ([]*Mo
 			continue
 		}
 		log.Logf(0, "module %v -> %v", mod.Name, path)
-		modules = append(modules, &Module{
+		modules = append(modules, &KernelModule{
 			Name: mod.Name,
 			Addr: mod.Addr,
 			Path: path,

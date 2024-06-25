@@ -49,6 +49,8 @@ type Config struct {
 	KernelSrc string `json:"kernel_src,omitempty"`
 	// Location of the driectory where the kernel was built (if not set defaults to KernelSrc)
 	KernelBuildSrc string `json:"kernel_build_src,omitempty"`
+	// Is the kernel built separately from the modules? (Specific to Android builds)
+	AndroidSplitBuild bool `json:"android_split_build"`
 	// Kernel subsystem with paths to each subsystem
 	//	"kernel_subsystem": [
 	//		{ "name": "sound", "path": ["sound", "techpack/audio"]},
@@ -129,7 +131,7 @@ type Config struct {
 	// This value is passed as an argument to executor and allows to adjust sandbox behavior
 	// via manager config. For example you can switch between system and user accounts based
 	// on this value.
-	SandboxArg int `json:"sandbox_arg"`
+	SandboxArg int64 `json:"sandbox_arg"`
 
 	// Use KCOV coverage (default: true).
 	Cover bool `json:"cover"`
@@ -202,8 +204,19 @@ type Config struct {
 	// More details can be found in pkg/asset/config.go.
 	AssetStorage *asset.Config `json:"asset_storage"`
 
+	// Experimental options.
+	Experimental Experimental
+
 	// Implementation details beyond this point. Filled after parsing.
 	Derived `json:"-"`
+}
+
+// These options are not guaranteed to be backward/forward compatible and
+// can be dropped at any moment.
+type Experimental struct {
+	// Don't let the VM state accumulate too much by restarting
+	// syz-executor before most prog executions.
+	ResetAccState bool `json:"reset_acc_state"`
 }
 
 type Subsystem struct {

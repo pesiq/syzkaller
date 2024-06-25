@@ -29,13 +29,17 @@ type Derived struct {
 	TargetVMArch string
 
 	// Full paths to binaries we are going to use:
-	FuzzerBin   string
 	ExecprogBin string
 	ExecutorBin string
 
 	Syscalls      []int
 	NoMutateCalls map[int]bool // Set of IDs of syscalls which should not be mutated.
 	Timeouts      targets.Timeouts
+
+	// Special debugging/development mode specified by VM type "none".
+	// In this mode syz-manager does not start any VMs, but instead a user is supposed
+	// to start syz-executor process in a VM manually.
+	VMLess bool
 }
 
 func LoadData(data []byte) (*Config, error) {
@@ -191,6 +195,7 @@ func Complete(cfg *Config) error {
 		}
 	}
 	cfg.initTimeouts()
+	cfg.VMLess = cfg.Type == "none"
 	return nil
 }
 
@@ -201,7 +206,7 @@ func (cfg *Config) initTimeouts() {
 		// Assuming qemu emulation.
 		// Quick tests of mmap syscall on arm64 show ~9x slowdown.
 		slowdown = 10
-	case cfg.Type == "gvisor" && cfg.Cover && strings.Contains(cfg.Name, "-race"):
+	case cfg.Type == targets.GVisor && cfg.Cover && strings.Contains(cfg.Name, "-race"):
 		// Go coverage+race has insane slowdown of ~350x. We can't afford such large value,
 		// but a smaller value should be enough to finish at least some syscalls.
 		// Note: the name check is a hack.
@@ -218,6 +223,10 @@ func checkNonEmpty(fields ...string) error {
 		}
 	}
 	return nil
+}
+
+func (cfg *Config) HasCovFilter() bool {
+	return len(cfg.CovFilter.Functions)+len(cfg.CovFilter.Files)+len(cfg.CovFilter.RawPCs) != 0
 }
 
 func (cfg *Config) CompleteKernelDirs() {
@@ -253,15 +262,11 @@ func (cfg *Config) completeBinaries() error {
 	targetBin := func(name, arch string) string {
 		return filepath.Join(cfg.Syzkaller, "bin", cfg.TargetOS+"_"+arch, name+exe)
 	}
-	cfg.FuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
 	cfg.ExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
 	cfg.ExecutorBin = targetBin("syz-executor", cfg.TargetArch)
 	// If the target already provides an executor binary, we don't need to copy it.
 	if cfg.SysTarget.ExecutorBin != "" {
 		cfg.ExecutorBin = ""
-	}
-	if !osutil.IsExist(cfg.FuzzerBin) {
-		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.FuzzerBin)
 	}
 	if !osutil.IsExist(cfg.ExecprogBin) {
 		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.ExecprogBin)

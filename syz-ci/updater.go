@@ -81,7 +81,6 @@ func NewSyzUpdater(cfg *Config) *SyzUpdater {
 		mgrcfg := mgr.managercfg
 		os, vmarch, arch := mgrcfg.TargetOS, mgrcfg.TargetVMArch, mgrcfg.TargetArch
 		targets[os+"/"+vmarch+"/"+arch] = true
-		syzFiles[fmt.Sprintf("bin/%v_%v/syz-fuzzer", os, vmarch)] = true
 		syzFiles[fmt.Sprintf("bin/%v_%v/syz-execprog", os, vmarch)] = true
 		if mgrcfg.SysTarget.ExecutorBin == "" {
 			syzFiles[fmt.Sprintf("bin/%v_%v/syz-executor", os, arch)] = true
@@ -194,6 +193,10 @@ func (upd *SyzUpdater) UpdateAndRestart() {
 	if err := osutil.CopyFile(latestBin, upd.exe); err != nil {
 		log.Fatal(err)
 	}
+	if *flagExitOnUpgrade {
+		log.Logf(0, "exiting, please restart syz-ci to run the new version")
+		os.Exit(0)
+	}
 	if err := syscall.Exec(upd.exe, os.Args, os.Environ()); err != nil {
 		log.Fatal(err)
 	}
@@ -247,12 +250,6 @@ func (upd *SyzUpdater) build(commit *vcs.Commit) error {
 			if err := osutil.CopyFile(src, dst); err != nil {
 				return err
 			}
-		}
-		cmd := osutil.Command(instance.MakeBin, "generate")
-		cmd.Dir = upd.syzkallerDir
-		cmd.Env = append([]string{"GOPATH=" + upd.gopathDir}, os.Environ()...)
-		if _, err := osutil.Run(time.Hour, cmd); err != nil {
-			return osutil.PrependContext("generate failed", err)
 		}
 	}
 	// This will also generate descriptions and should go before the 'go test' below.
@@ -309,7 +306,7 @@ func (upd *SyzUpdater) uploadBuildError(commit *vcs.Commit, buildErr error) {
 	title = "syzkaller: " + title
 	for _, mgrcfg := range upd.cfg.Managers {
 		if upd.dashboardAddr == "" || mgrcfg.DashboardClient == "" {
-			log.Logf(0, "not uploading build error fr %v: no dashboard", mgrcfg.Name)
+			log.Logf(0, "not uploading build error for %v: no dashboard", mgrcfg.Name)
 			continue
 		}
 		dash, err := dashapi.New(mgrcfg.DashboardClient, upd.dashboardAddr, mgrcfg.DashboardKey)

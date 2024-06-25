@@ -78,34 +78,64 @@ func (comp *compiler) extractConsts() map[string]*ConstInfo {
 				comp.addConst(infos, pos, comp.target.SyscallPrefix+n.CallName)
 			}
 			for _, attr := range n.Attrs {
-				if callAttrs[attr.Ident].HasArg {
+				if callAttrs[attr.Ident].Type == intAttr {
 					comp.addConst(infos, attr.Pos, attr.Args[0].Ident)
 				}
 			}
 		case *ast.Struct:
 			for _, attr := range n.Attrs {
-				if structOrUnionAttrs(n)[attr.Ident].HasArg {
+				attrDesc := structOrUnionAttrs(n)[attr.Ident]
+				if attrDesc.Type == intAttr {
 					comp.addConst(infos, attr.Pos, attr.Args[0].Ident)
 				}
 			}
+			foreachFieldAttrConst(n, func(t *ast.Type) {
+				comp.addConst(infos, t.Pos, t.Ident)
+			})
 		}
 		switch decl.(type) {
 		case *ast.Call, *ast.Struct, *ast.Resource, *ast.TypeDef:
 			comp.extractTypeConsts(infos, decl)
 		}
 	}
-	comp.desc.Walk(ast.Recursive(func(n0 ast.Node) {
+	comp.desc.Walk(ast.Recursive(func(n0 ast.Node) bool {
 		if n, ok := n0.(*ast.Int); ok {
 			comp.addConst(infos, n.Pos, n.Ident)
 		}
+		return true
 	}))
 	return convertConstInfo(infos, comp.fileMeta)
+}
+
+func foreachFieldAttrConst(n *ast.Struct, cb func(*ast.Type)) {
+	for _, field := range n.Fields {
+		for _, attr := range field.Attrs {
+			attrDesc := structOrUnionFieldAttrs(n)[attr.Ident]
+			if attrDesc == nil {
+				return
+			}
+			if attrDesc.Type != exprAttr {
+				// For now, only these field attrs may have consts.
+				return
+			}
+			ast.Recursive(func(n ast.Node) bool {
+				t, ok := n.(*ast.Type)
+				if !ok || t.Expression != nil {
+					return true
+				}
+				if t.Ident != valueIdent {
+					cb(t)
+				}
+				return false
+			})(attr.Args[0])
+		}
+	}
 }
 
 func (comp *compiler) extractTypeConsts(infos map[string]*constInfo, n ast.Node) {
 	comp.foreachType(n, func(t *ast.Type, desc *typeDesc, args []*ast.Type, _ prog.IntTypeCommon) {
 		for i, arg := range args {
-			if desc.Args[i].Type.Kind == kindInt {
+			if desc.Args[i].Type.Kind&kindInt != 0 {
 				if arg.Ident != "" {
 					comp.addConst(infos, arg.Pos, arg.Ident)
 				}
@@ -121,6 +151,13 @@ func (comp *compiler) extractTypeConsts(infos map[string]*constInfo, n ast.Node)
 
 func (comp *compiler) addConst(infos map[string]*constInfo, pos ast.Pos, name string) {
 	if _, builtin := comp.builtinConsts[name]; builtin {
+		return
+	}
+	// In case of intN[identA], identA may refer to a constant or to a set of
+	// flags. To avoid marking all flags as constants, we must check here
+	// whether identA refers to a flag. We have a check in the compiler to
+	// ensure an identifier can never refer to both a constant and flags.
+	if _, isFlag := comp.intFlags[name]; isFlag {
 		return
 	}
 	info := getConstInfo(infos, pos)
@@ -228,7 +265,7 @@ func (comp *compiler) patchConsts(consts0 map[string]uint64) {
 			comp.foreachType(decl, func(_ *ast.Type, desc *typeDesc,
 				args []*ast.Type, _ prog.IntTypeCommon) {
 				for i, arg := range args {
-					if desc.Args[i].Type.Kind == kindInt {
+					if desc.Args[i].Type.Kind&kindInt != 0 {
 						comp.patchTypeConst(arg, consts, &missing)
 					}
 				}
@@ -240,16 +277,20 @@ func (comp *compiler) patchConsts(consts0 map[string]uint64) {
 				}
 			case *ast.Call:
 				for _, attr := range n.Attrs {
-					if callAttrs[attr.Ident].HasArg {
+					if callAttrs[attr.Ident].Type == intAttr {
 						comp.patchTypeConst(attr.Args[0], consts, &missing)
 					}
 				}
 			case *ast.Struct:
 				for _, attr := range n.Attrs {
-					if structOrUnionAttrs(n)[attr.Ident].HasArg {
+					attrDesc := structOrUnionAttrs(n)[attr.Ident]
+					if attrDesc.Type == intAttr {
 						comp.patchTypeConst(attr.Args[0], consts, &missing)
 					}
 				}
+				foreachFieldAttrConst(n, func(t *ast.Type) {
+					comp.patchTypeConst(t, consts, &missing)
+				})
 			}
 			if missing == "" {
 				continue
@@ -295,6 +336,11 @@ func (comp *compiler) patchConst(val *uint64, id *string, consts map[string]uint
 			*id = ""
 		}
 		*val = v
+		return true
+	}
+	// This check is necessary because in intN[identA], identA may be a
+	// constant or a set of flags.
+	if _, isFlag := comp.intFlags[*id]; isFlag {
 		return true
 	}
 	if missing != nil && *missing == "" {

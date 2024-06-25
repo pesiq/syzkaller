@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -15,7 +16,6 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/vcs"
-	"golang.org/x/net/context"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
 	"google.golang.org/appengine/v2/user"
@@ -220,14 +220,25 @@ func patchTestJobArgs(c context.Context, args *testJobArgs) error {
 		args.branch = build.KernelBranch
 		args.repo = build.KernelRepo
 	}
+	// Let trees be also identified by their alias names.
+	for _, repo := range getNsConfig(c, args.bug.Namespace).Repos {
+		if repo.Alias != "" && repo.Alias == args.repo {
+			args.repo = repo.URL
+			break
+		}
+	}
 	return nil
+}
+
+func crashNeedsRepro(title string) bool {
+	return !strings.Contains(title, "boot error:") &&
+		!strings.Contains(title, "test error:") &&
+		!strings.Contains(title, "build error")
 }
 
 func checkTestJob(args *testJobArgs) string {
 	crash, bug := args.crash, args.bug
-	needRepro := !strings.Contains(crash.Title, "boot error:") &&
-		!strings.Contains(crash.Title, "test error:") &&
-		!strings.Contains(crash.Title, "build error")
+	needRepro := crashNeedsRepro(crash.Title)
 	switch {
 	case needRepro && crash.ReproC == 0 && crash.ReproSyz == 0:
 		return "This crash does not have a reproducer. I cannot test it."
@@ -1347,13 +1358,7 @@ func bisectFromJob(c context.Context, job *Job) (*dashapi.BisectResult, []string
 		CrossTree:       job.IsCrossTree(),
 	}
 	for _, com := range job.Commits {
-		bisect.Commits = append(bisect.Commits, &dashapi.Commit{
-			Hash:       com.Hash,
-			Title:      com.Title,
-			Author:     com.Author,
-			AuthorName: com.AuthorName,
-			Date:       com.Date,
-		})
+		bisect.Commits = append(bisect.Commits, com.toDashapi())
 	}
 	var newEmails []string
 	if len(bisect.Commits) == 1 {
@@ -1362,6 +1367,9 @@ func bisectFromJob(c context.Context, job *Job) (*dashapi.BisectResult, []string
 		com := job.Commits[0]
 		newEmails = []string{com.Author}
 		newEmails = append(newEmails, strings.Split(com.CC, "|")...)
+	}
+	if job.BackportedCommit.Title != "" {
+		bisect.Backported = job.BackportedCommit.toDashapi()
 	}
 	return bisect, newEmails
 }
@@ -1618,6 +1626,102 @@ func uniqueBugs(c context.Context, inBugs []*Bug, inKeys []*db.Key) ([]*Bug, []*
 		keys = append(keys, inKeys[i])
 	}
 	return bugs, keys
+}
+
+func relevantBackportJobs(c context.Context) (
+	bugs []*Bug, jobs []*Job, jobKeys []*db.Key, err error) {
+	allBugs, _, bugsErr := loadAllBugs(c, func(query *db.Query) *db.Query {
+		return query.Filter("FixCandidateJob>", "").Filter("Status=", BugStatusOpen)
+	})
+	if bugsErr != nil {
+		err = bugsErr
+		return
+	}
+	var allJobKeys []*db.Key
+	for _, bug := range allBugs {
+		jobKey, decodeErr := db.DecodeKey(bug.FixCandidateJob)
+		if decodeErr != nil {
+			err = decodeErr
+			return
+		}
+		allJobKeys = append(allJobKeys, jobKey)
+	}
+	allJobs := make([]*Job, len(allJobKeys))
+	err = db.GetMulti(c, allJobKeys, allJobs)
+	if err != nil {
+		return
+	}
+	for i, job := range allJobs {
+		// Some assertions just in case.
+		jobKey := allJobKeys[i]
+		if !job.IsCrossTree() {
+			err = fmt.Errorf("job %s: expected to be cross-tree", jobKey)
+			return
+		}
+		if len(job.Commits) != 1 || job.InvalidatedBy != "" ||
+			job.BackportedCommit.Title != "" {
+			continue
+		}
+		bugs = append(bugs, allBugs[i])
+		jobs = append(jobs, job)
+		jobKeys = append(jobKeys, jobKey)
+	}
+	return
+}
+
+func updateBackportCommits(c context.Context, ns string, commits []dashapi.Commit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+	perTitle := map[string]dashapi.Commit{}
+	for _, commit := range commits {
+		perTitle[commit.Title] = commit
+	}
+	bugs, jobs, jobKeys, err := relevantBackportJobs(c)
+	if err != nil {
+		return fmt.Errorf("failed to query backport jobs: %w", err)
+	}
+	for i, job := range jobs {
+		rawCommit, ok := perTitle[job.Commits[0].Title]
+		if !ok {
+			continue
+		}
+		if bugs[i].Namespace != ns {
+			continue
+		}
+		commit := Commit{
+			Hash:       rawCommit.Hash,
+			Title:      rawCommit.Title,
+			Author:     rawCommit.Author,
+			AuthorName: rawCommit.AuthorName,
+			Date:       rawCommit.Date,
+		}
+		err := commitBackported(c, jobKeys[i], commit)
+		if err != nil {
+			return fmt.Errorf("failed to update backport job: %w", err)
+		}
+	}
+	return nil
+}
+
+func commitBackported(c context.Context, jobKey *db.Key, commit Commit) error {
+	tx := func(c context.Context) error {
+		job := new(Job)
+		if err := db.Get(c, jobKey, job); err != nil {
+			return fmt.Errorf("failed to get job: %w", err)
+		}
+		if job.BackportedCommit.Title != "" {
+			// Nothing to update.
+			return nil
+		}
+		job.BackportedCommit = commit
+		job.Reported = false
+		if _, err := db.Put(c, jobKey, job); err != nil {
+			return fmt.Errorf("failed to put job: %w", err)
+		}
+		return nil
+	}
+	return db.RunInTransaction(c, tx, &db.TransactionOptions{Attempts: 5})
 }
 
 type bugJobs struct {

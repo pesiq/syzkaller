@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/sys/targets"
-	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/appengine/v2"
 	db "google.golang.org/appengine/v2/datastore"
@@ -496,11 +496,15 @@ func queryLatestManagerAssets(c context.Context, ns string, assetType dashapi.As
 	return ret, nil
 }
 
-func createAssetList(build *Build, crash *Crash) []dashapi.Asset {
+func createAssetList(build *Build, crash *Crash, forReport bool) []dashapi.Asset {
+	var crashAssets []Asset
+	if crash != nil {
+		crashAssets = crash.Assets
+	}
 	assetList := []dashapi.Asset{}
-	for _, reportAsset := range append(build.Assets, crash.Assets...) {
+	for _, reportAsset := range append(build.Assets, crashAssets...) {
 		typeDescr := asset.GetTypeDescription(reportAsset.Type)
-		if typeDescr == nil || typeDescr.NoReporting {
+		if typeDescr == nil || forReport && typeDescr.NoReporting {
 			continue
 		}
 		assetList = append(assetList, dashapi.Asset{

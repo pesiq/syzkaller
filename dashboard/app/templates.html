@@ -76,12 +76,16 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 					{{end}}
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/bugs" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/bugs'>
 						<span style="color:DarkOrange;">📈</span> Kernel Health</a>
+					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/found-bugs" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/found-bugs'>
+						<span style="color:DarkOrange;">📈</span> Bugs/Month</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/lifetimes" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/lifetimes'>
 						<span style="color:DarkOrange;">📈</span> Bug Lifetimes</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/fuzzing" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/fuzzing'>
 					  <span style="color:DarkOrange;">📈</span> Fuzzing</a>
 					<a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/crashes" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/crashes'>
-						<span style="color:DarkOrange;">📈</span> Crashes</a> 
+						<span style="color:DarkOrange;">📈</span> Crashes</a>
+          <a class="navigation_tab{{if eq .URLPath (printf "/%v/graph/crashes" $.Namespace)}}_selected{{end}}" href='/{{$.Namespace}}/graph/coverage'>
+            <span style="color:DarkOrange;">📈</span> Coverage</a>
 				</td>
                                 {{if .ContactEmail}}
 				<td class="navigation-right">
@@ -190,10 +194,10 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			{{if $.DispDiscuss}}
 			{{$d := $b.Discussions}}
 			<td class="discussions" sort-value="{{formatLateness $.Now $d.LastMessage}}">
-			{{- if $d.LastPatchMessage.IsZero -}}
-				<span class="icon">&#128172;</span> {{$d.ExternalMessages}} [{{formatLateness $.Now $d.LastMessage}}]
-			{{else}}
+			{{- if not $d.LastPatchMessage.IsZero -}}
 				<b>PATCH</b> [{{formatLateness $.Now $d.LastPatchMessage}}]
+			{{- else if $d.ExternalMessages -}}
+				<span class="icon">&#128172;</span> {{$d.ExternalMessages}} [{{formatLateness $.Now $d.LastMessage}}]
 			{{- end -}}
 			</td>
 			{{end}}
@@ -237,6 +241,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		<th>Execs</th>
 		<th colspan="4">Kernel build</th>
 		<th colspan="3">syzkaller build</th>
+		<th colspan="2" title="Show subset of bugs that happened on this instance">Bugs</th>
 	</tr>
 	<tr>
 		<th></th>
@@ -253,12 +258,14 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		<th>Commit</th>
 		<th>Freshness</th>
 		<th>Status</th>
+		<th title="Subset of bugs that happened on this instance">All</th>
+		<th title="Subset of bugs that happened only on this instance">Only</th>
 	</tr>
 	</thead>
 	<tbody>
 	{{range $mgr := .List}}
 		<tr>
-			<td>{{link $mgr.Link $mgr.Name}}</td>
+			<td>{{link $mgr.PageLink $mgr.Name}}</td>
 			<td class="stat {{if not $mgr.CurrentUpTime}}bad{{end}}">{{formatLateness $mgr.Now $mgr.LastActive}}</td>
 			<td class="stat">{{formatDuration $mgr.CurrentUpTime}}</td>
 			<td class="stat">{{formatStat $mgr.MaxCorpus}}</td>
@@ -294,6 +301,8 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 				<td></td>
 				<td></td>
 			{{end}}
+			<td><a href="?manager={{$mgr.Name}}">all</a></td>
+			<td><a href="?only_manager={{$mgr.Name}}">only</a></td>
 		</tr>
 	{{end}}
 	</tbody>
@@ -418,7 +427,10 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<td class="config">{{if $b.KernelConfigLink}}<a href="{{$b.KernelConfigLink}}">.config</a>{{end}}</td>
 			<td class="repro">{{if $b.LogLink}}<a href="{{$b.LogLink}}">{{if $b.LogHasStrace}}strace{{else}}console{{end}} log</a>{{end}}</td>
 			<td class="repro">{{if $b.ReportLink}}<a href="{{$b.ReportLink}}">report</a>{{end}}</td>
-			<td class="repro{{if $b.ReproIsRevoked}} stale_repro{{end}}">{{if $b.ReproSyzLink}}<a href="{{$b.ReproSyzLink}}">syz</a>{{end}}</td>
+			<td class="repro{{if $b.ReproIsRevoked}} stale_repro{{end}}">
+				{{if $b.ReproSyzLink}}<a href="{{$b.ReproSyzLink}}">syz</a>{{end}}
+				{{if $b.ReproLogLink}} / <a href="{{$b.ReproLogLink}}">log</a>{{end}}
+			</td>
 			<td class="repro{{if $b.ReproIsRevoked}} stale_repro{{end}}">{{if $b.ReproCLink}}<a href="{{$b.ReproCLink}}">C</a>{{end}}</td>
 			<td class="repro">{{if $b.MachineInfoLink}}<a href="{{$b.MachineInfoLink}}">info</a>{{end}}</td>
 			<td class="assets">{{range $i, $asset := .Assets}}

@@ -12,6 +12,19 @@ type Prog struct {
 	Target   *Target
 	Calls    []*Call
 	Comments []string
+
+	// Was deserialized using Unsafe mode, so can do unsafe things.
+	isUnsafe bool
+}
+
+func (p *Prog) CallName(call int) string {
+	if call >= len(p.Calls) || call < -1 {
+		panic(fmt.Sprintf("bad call index %v/%v", call, len(p.Calls)))
+	}
+	if call == -1 {
+		return ".extra"
+	}
+	return p.Calls[call].Meta.Name
 }
 
 // These properties are parsed and serialized according to the tag and the type
@@ -267,6 +280,10 @@ type UnionArg struct {
 	ArgCommon
 	Option Arg
 	Index  int // Index of the selected option in the union type.
+	// Used for unions with conditional fields.
+	// We first create a dummy arg with transient=True and then
+	// patch them.
+	transient bool
 }
 
 func MakeUnionArg(t Type, dir Dir, opt Arg, index int) *UnionArg {
@@ -350,6 +367,9 @@ func (p *Prog) insertBefore(c *Call, calls []*Call) {
 
 // replaceArg replaces arg with arg1 in a program.
 func replaceArg(arg, arg1 Arg) {
+	if arg == arg1 {
+		panic("replacing an argument with itself")
+	}
 	switch a := arg.(type) {
 	case *ConstArg:
 		*a = *arg1.(*ConstArg)
@@ -358,18 +378,37 @@ func replaceArg(arg, arg1 Arg) {
 	case *PointerArg:
 		*a = *arg1.(*PointerArg)
 	case *UnionArg:
+		if a.Option != nil {
+			removeArg(a.Option)
+		}
 		*a = *arg1.(*UnionArg)
 	case *DataArg:
 		*a = *arg1.(*DataArg)
 	case *GroupArg:
+		_, isStruct := arg.Type().(*StructType)
 		a1 := arg1.(*GroupArg)
-		if len(a.Inner) != len(a1.Inner) {
+		if isStruct && len(a.Inner) != len(a1.Inner) {
 			panic(fmt.Sprintf("replaceArg: group fields don't match: %v/%v",
 				len(a.Inner), len(a1.Inner)))
 		}
 		a.ArgCommon = a1.ArgCommon
-		for i := range a.Inner {
+		// Replace min(|a|, |a1|) arguments.
+		for i := 0; i < len(a.Inner) && i < len(a1.Inner); i++ {
 			replaceArg(a.Inner[i], a1.Inner[i])
+		}
+		// Remove extra arguments of a.
+		for len(a.Inner) > len(a1.Inner) {
+			i := len(a.Inner) - 1
+			removeArg(a.Inner[i])
+			a.Inner[i] = nil
+			a.Inner = a.Inner[:i]
+		}
+		// Add extra arguments to a.
+		for i := len(a.Inner); i < len(a1.Inner); i++ {
+			a.Inner = append(a.Inner, a1.Inner[i])
+		}
+		if debug && len(a.Inner) != len(a1.Inner) {
+			panic("replaceArg implementation bug")
 		}
 	default:
 		panic(fmt.Sprintf("replaceArg: bad arg kind %#v", arg))
@@ -414,12 +453,12 @@ func removeArg(arg0 Arg) {
 	})
 }
 
-// The public alias for the removeArg method.
+// RemoveArg is the public alias for the removeArg method.
 func RemoveArg(arg Arg) {
 	removeArg(arg)
 }
 
-// removeCall removes call idx from p.
+// RemoveCall removes call idx from p.
 func (p *Prog) RemoveCall(idx int) {
 	c := p.Calls[idx]
 	for _, arg := range c.Args {

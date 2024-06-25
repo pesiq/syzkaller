@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/hash"
-	"golang.org/x/net/context"
 	"google.golang.org/appengine/v2"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
@@ -243,17 +243,12 @@ func findSubsystemReportByID(c context.Context, ID string) (*Subsystem,
 func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Reporting,
 	config *BugListReportingConfig) (*SubsystemReport, error) {
 	rawOpenBugs, fixedBugs, err := queryMatchingBugs(c, subsystem.Namespace,
-		subsystem.Name, reporting.AccessLevel)
+		subsystem.Name, reporting)
 	if err != nil {
 		return nil, err
 	}
 	withRepro, noRepro := []*Bug{}, []*Bug{}
 	for _, bug := range rawOpenBugs {
-		currReporting, _, _, _, _ := currentReporting(c, bug)
-		if reporting.Name != currReporting.Name {
-			// The big is not at the expected reporting stage.
-			continue
-		}
 		const possiblyFixedTimespan = 24 * time.Hour * 14
 		if bug.LastTime.Before(timeNow(c).Add(-possiblyFixedTimespan)) {
 			// The bug didn't happen recently, possibly it was already fixed.
@@ -262,6 +257,11 @@ func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Re
 		}
 		if bug.FirstTime.After(timeNow(c).Add(-config.MinBugAge)) {
 			// Don't take bugs which are too new -- they're still fresh in memory.
+			continue
+		}
+		if bug.prio() == LowPrioBug {
+			// Don't include low priority bugs in reports because the community
+			// actually perceives them as non-actionable.
 			continue
 		}
 		discussions := bug.discussionSummary()
@@ -323,28 +323,31 @@ func querySubsystemReport(c context.Context, subsystem *Subsystem, reporting *Re
 }
 
 func makeSubsystemReportStats(c context.Context, open, fixed []*Bug, days int) SubsystemReportStats {
-	if days > 0 {
-		after := timeNow(c).Add(-time.Hour * 24 * time.Duration(days))
-		ret := SubsystemReportStats{}
-		for _, bug := range open {
-			if bug.FirstTime.After(after) {
-				ret.Reported++
-			}
+	after := timeNow(c).Add(-time.Hour * 24 * time.Duration(days))
+	ret := SubsystemReportStats{}
+	for _, bug := range open {
+		if days > 0 && bug.FirstTime.Before(after) {
+			continue
 		}
-		for _, bug := range fixed {
-			if len(bug.CommitInfo) > 0 && bug.CommitInfo[0].Date.After(after) {
-				ret.Fixed++
-			}
+		if bug.prio() == LowPrioBug {
+			ret.LowPrio++
+		} else {
+			ret.Reported++
 		}
-		return ret
 	}
-	return SubsystemReportStats{
-		Reported: len(open),
-		Fixed:    len(fixed),
+	for _, bug := range fixed {
+		if len(bug.CommitInfo) == 0 {
+			continue
+		}
+		if days > 0 && bug.CommitInfo[0].Date.Before(after) {
+			continue
+		}
+		ret.Fixed++
 	}
+	return ret
 }
 
-func queryMatchingBugs(c context.Context, ns, name string, accessLevel AccessLevel) ([]*Bug, []*Bug, error) {
+func queryMatchingBugs(c context.Context, ns, name string, reporting *Reporting) ([]*Bug, []*Bug, error) {
 	allOpenBugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
 		return query.Filter("Namespace=", ns).
 			Filter("Status=", BugStatusOpen).
@@ -374,7 +377,11 @@ func queryMatchingBugs(c context.Context, ns, name string, accessLevel AccessLev
 		if err != nil {
 			continue
 		}
-		if currReporting.AccessLevel > accessLevel {
+		if reporting.Name != currReporting.Name {
+			// The bug is not at the expected reporting stage.
+			continue
+		}
+		if currReporting.AccessLevel > reporting.AccessLevel {
 			continue
 		}
 		open = append(open, bug)

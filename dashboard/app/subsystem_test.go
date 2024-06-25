@@ -345,7 +345,7 @@ func TestPeriodicSubsystemReminders(t *testing.T) {
 
 	// Make sure we don't report crashes at other reporting stages.
 	crash := testCrash(build, 1)
-	crash.Title = `WARNING: a third, keep private` // see the config in app_test.go
+	crash.Title = `WARNING: a third, keep in moderation` // see the config in app_test.go
 	crash.GuiltyFiles = []string{"a.c"}
 	client.ReportCrash(crash)
 	client.pollBug()
@@ -1056,8 +1056,9 @@ This is a 30-day syzbot report for the subsystemA subsystem.
 All related reports/information can be found at:
 https://testapp.appspot.com/subsystem-reminders/s/subsystemA
 
-During the period, 3 new issues were detected and 0 were fixed.
-In total, 3 issues are still open.
+During the period, 2 new issues were detected and 0 were fixed.
+In total, 2 issues are still open.
+There is also 1 low-priority issue.
 
 Some of the still happening issues:
 
@@ -1066,8 +1067,6 @@ Ref Crashes Repro Title
                   https://testapp.appspot.com/bug?extid=%[1]v
 <2> 2       No    WARNING: a second
                   https://testapp.appspot.com/bug?extid=%[2]v
-<3> 2       Yes   WARNING: a first
-                  https://testapp.appspot.com/bug?extid=%[3]v
 
 The report will be sent to: [subsystemA@list.com subsystemA@person.com].
 

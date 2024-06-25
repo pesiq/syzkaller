@@ -2,7 +2,6 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build !ppc64le
-// +build !ppc64le
 
 package adb
 
@@ -324,7 +323,7 @@ func (inst *instance) adbWithTimeout(timeout time.Duration, args ...string) ([]b
 }
 
 func (inst *instance) waitForBootCompletion() {
-	// ADB connects to a phone and starts syz-fuzzer while the phone is still booting.
+	// ADB connects to a phone and starts syz-executor while the phone is still booting.
 	// This enables syzkaller to create a race condition which in certain cases doesn't
 	// allow the phone to finalize initialization.
 	// To determine whether a system has booted and started all system processes and
@@ -494,6 +493,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	if _, err := inst.adb("push", hostSrc, vmDst); err != nil {
 		return "", err
 	}
+	inst.adb("shell", "chmod", "+x", vmDst)
 	return vmDst, nil
 }
 

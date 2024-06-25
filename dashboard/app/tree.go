@@ -9,13 +9,13 @@ package main
 // b) LabelReached -- reproducer does not work in any other kernel tree, TO which commits flow.
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
-	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
@@ -228,7 +228,7 @@ func (ctx *bugTreeContext) setOriginLabels() pollTreeJobResult {
 	return pollResultSkip{}
 }
 
-// selectRepoNodes attributes bugs to trees depending on the patch testing results.
+// selectRepoLabels attributes bugs to trees depending on the patch testing results.
 func (ctx *bugTreeContext) selectRepoLabels(in bool, results map[*repoNode]pollTreeJobResult) []string {
 	crashed := map[*repoNode]bool{}
 	for node, result := range results {

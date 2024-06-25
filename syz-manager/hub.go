@@ -4,18 +4,21 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/auth"
+	"github.com/google/syzkaller/pkg/flatrpc"
+	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/hash"
-	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/rpctype"
+	"github.com/google/syzkaller/pkg/stats"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -40,13 +43,20 @@ func (mgr *Manager) hubSyncLoop(keyGet keyGetter) {
 		mgr:           mgr,
 		cfg:           mgr.cfg,
 		target:        mgr.target,
-		stats:         mgr.stats,
 		domain:        mgr.cfg.TargetOS + "/" + mgr.cfg.HubDomain,
 		enabledCalls:  mgr.targetEnabledSyscalls,
-		leak:          mgr.checkResult.Features[host.FeatureLeak].Enabled,
+		leak:          mgr.enabledFeatures&flatrpc.FeatureLeak != 0,
 		fresh:         mgr.fresh,
-		hubReproQueue: mgr.hubReproQueue,
+		hubReproQueue: mgr.externalReproQueue,
 		keyGet:        keyGet,
+
+		statSendProgAdd:   stats.Create("hub send prog add", "", stats.Graph("hub progs")),
+		statSendProgDel:   stats.Create("hub send prog del", "", stats.Graph("hub progs")),
+		statRecvProg:      stats.Create("hub recv prog", "", stats.Graph("hub progs")),
+		statRecvProgDrop:  stats.Create("hub recv prog drop", "", stats.NoGraph),
+		statSendRepro:     stats.Create("hub send repro", "", stats.Graph("hub repros")),
+		statRecvRepro:     stats.Create("hub recv repro", "", stats.Graph("hub repros")),
+		statRecvReproDrop: stats.Create("hub recv repro drop", "", stats.NoGraph),
 	}
 	if mgr.cfg.Reproduce && mgr.dash != nil {
 		hc.needMoreRepros = mgr.needMoreRepros
@@ -58,7 +68,6 @@ type HubConnector struct {
 	mgr            HubManagerView
 	cfg            *mgrconfig.Config
 	target         *prog.Target
-	stats          *Stats
 	domain         string
 	enabledCalls   map[*prog.Syscall]bool
 	leak           bool
@@ -68,12 +77,20 @@ type HubConnector struct {
 	hubReproQueue  chan *Crash
 	needMoreRepros chan chan bool
 	keyGet         keyGetter
+
+	statSendProgAdd   *stats.Val
+	statSendProgDel   *stats.Val
+	statRecvProg      *stats.Val
+	statRecvProgDrop  *stats.Val
+	statSendRepro     *stats.Val
+	statRecvRepro     *stats.Val
+	statRecvReproDrop *stats.Val
 }
 
 // HubManagerView restricts interface between HubConnector and Manager.
 type HubManagerView interface {
 	getMinimizedCorpus() (corpus, repros [][]byte)
-	addNewCandidates(candidates []rpctype.Candidate)
+	addNewCandidates(candidates []fuzzer.Candidate)
 	hubIsUnreachable()
 }
 
@@ -113,6 +130,10 @@ func (hc *HubConnector) connect(corpus [][]byte) (*rpctype.RPCClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	hub, err := rpctype.NewRPCClient(hc.cfg.HubAddr)
+	if err != nil {
+		return nil, err
+	}
 	a := &rpctype.HubConnectArgs{
 		Client:  hc.cfg.HubClient,
 		Key:     key,
@@ -135,12 +156,14 @@ func (hc *HubConnector) connect(corpus [][]byte) (*rpctype.RPCClient, error) {
 	if len(a.Corpus) > max {
 		a.Corpus = a.Corpus[:max]
 	}
+	err = hub.Call("Hub.Connect", a, nil)
 	// Hub.Connect request can be very large, so do it on a transient connection
 	// (rpc connection buffers never shrink).
-	if err := rpctype.RPCCall(hc.cfg.HubAddr, 1, "Hub.Connect", a, nil); err != nil {
+	hub.Close()
+	if err != nil {
 		return nil, err
 	}
-	hub, err := rpctype.NewRPCClient(hc.cfg.HubAddr, 1)
+	hub, err = rpctype.NewRPCClient(hc.cfg.HubAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -189,13 +212,13 @@ func (hc *HubConnector) sync(hub *rpctype.RPCClient, corpus [][]byte) error {
 		}
 		minimized, smashed, progDropped := hc.processProgs(r.Inputs)
 		reproDropped := hc.processRepros(r.Repros)
-		hc.stats.hubSendProgAdd.add(len(a.Add))
-		hc.stats.hubSendProgDel.add(len(a.Del))
-		hc.stats.hubSendRepro.add(len(a.Repros))
-		hc.stats.hubRecvProg.add(len(r.Inputs) - progDropped)
-		hc.stats.hubRecvProgDrop.add(progDropped)
-		hc.stats.hubRecvRepro.add(len(r.Repros) - reproDropped)
-		hc.stats.hubRecvReproDrop.add(reproDropped)
+		hc.statSendProgAdd.Add(len(a.Add))
+		hc.statSendProgDel.Add(len(a.Del))
+		hc.statSendRepro.Add(len(a.Repros))
+		hc.statRecvProg.Add(len(r.Inputs) - progDropped)
+		hc.statRecvProgDrop.Add(progDropped)
+		hc.statRecvRepro.Add(len(r.Repros) - reproDropped)
+		hc.statRecvReproDrop.Add(reproDropped)
 		log.Logf(0, "hub sync: send: add %v, del %v, repros %v;"+
 			" recv: progs %v (min %v, smash %v), repros %v; more %v",
 			len(a.Add), len(a.Del), len(a.Repros),
@@ -213,26 +236,27 @@ func (hc *HubConnector) sync(hub *rpctype.RPCClient, corpus [][]byte) error {
 }
 
 func (hc *HubConnector) processProgs(inputs []rpctype.HubInput) (minimized, smashed, dropped int) {
-	candidates := make([]rpctype.Candidate, 0, len(inputs))
+	candidates := make([]fuzzer.Candidate, 0, len(inputs))
 	for _, inp := range inputs {
-		bad, disabled := checkProgram(hc.target, hc.enabledCalls, inp.Prog)
-		if bad != nil || disabled {
-			log.Logf(0, "rejecting program from hub (bad=%v, disabled=%v):\n%s",
-				bad, disabled, inp)
+		p, err := hc.parseProgram(inp.Prog)
+		if err != nil {
+			log.Logf(0, "rejecting program from hub: %v\n%s", err, inp.Prog)
 			dropped++
 			continue
 		}
 		min, smash := matchDomains(hc.domain, inp.Domain)
+		var flags fuzzer.ProgFlags
 		if min {
 			minimized++
+			flags |= fuzzer.ProgMinimized
 		}
 		if smash {
 			smashed++
+			flags |= fuzzer.ProgSmashed
 		}
-		candidates = append(candidates, rpctype.Candidate{
-			Prog:      inp.Prog,
-			Minimized: min,
-			Smashed:   smash,
+		candidates = append(candidates, fuzzer.Candidate{
+			Prog:  p,
+			Flags: flags,
 		})
 	}
 	hc.mgr.addNewCandidates(candidates)
@@ -268,10 +292,9 @@ func splitDomains(domain string) (string, string) {
 func (hc *HubConnector) processRepros(repros [][]byte) int {
 	dropped := 0
 	for _, repro := range repros {
-		bad, disabled := checkProgram(hc.target, hc.enabledCalls, repro)
-		if bad != nil || disabled {
-			log.Logf(0, "rejecting repro from hub (bad=%v, disabled=%v):\n%s",
-				bad, disabled, repro)
+		_, err := hc.parseProgram(repro)
+		if err != nil {
+			log.Logf(0, "rejecting repro from hub: %v\n%s", err, repro)
 			dropped++
 			continue
 		}
@@ -283,8 +306,7 @@ func (hc *HubConnector) processRepros(repros [][]byte) int {
 			typ = crash.MemoryLeak
 		}
 		hc.hubReproQueue <- &Crash{
-			vmIndex: -1,
-			hub:     true,
+			fromHub: true,
 			Report: &report.Report{
 				Title:  "external repro",
 				Type:   typ,
@@ -293,4 +315,15 @@ func (hc *HubConnector) processRepros(repros [][]byte) int {
 		}
 	}
 	return dropped
+}
+
+func (hc *HubConnector) parseProgram(data []byte) (*prog.Prog, error) {
+	p, err := loadProg(hc.target, data)
+	if err != nil {
+		return nil, err
+	}
+	if containsDisabled(p, hc.enabledCalls) {
+		return nil, fmt.Errorf("contains disabled calls")
+	}
+	return p, nil
 }

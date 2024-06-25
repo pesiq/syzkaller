@@ -4,9 +4,7 @@
 package report
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -34,6 +32,7 @@ type linux struct {
 	reportStartIgnores    []*regexp.Regexp
 	infoMessagesWithStack [][]byte
 	eoi                   []byte
+	symbolizerCache       symbolizer.Cache
 }
 
 func ctorLinux(cfg *config) (reporterImpl, []string, error) {
@@ -127,11 +126,11 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		"panic: failed to create temp dir",
 		"fatal error: unexpected signal during runtime execution", // presubmably OOM turned into SIGBUS
 		"signal SIGBUS: bus error",                                // presubmably OOM turned into SIGBUS
-		"Out of memory: Kill process .* \\(syz-fuzzer\\)",
+		"Out of memory: Kill process .* \\(syz-executor\\)",
 		"Out of memory: Kill process .* \\(sshd\\)",
-		"Killed process .* \\(syz-fuzzer\\)",
+		"Killed process .* \\(syz-executor\\)",
 		"Killed process .* \\(sshd\\)",
-		"lowmemorykiller: Killing 'syz-fuzzer'",
+		"lowmemorykiller: Killing 'syz-executor'",
 		"lowmemorykiller: Killing 'sshd'",
 		"INIT: PANIC: segmentation violation!",
 		"\\*\\*\\* stack smashing detected \\*\\*\\*: terminated",
@@ -374,7 +373,6 @@ func (ctx *linux) Symbolize(rep *Report) error {
 			return err
 		}
 	}
-
 	rep.Report = ctx.decompileOpcodes(rep.Report, rep)
 
 	// Skip getting maintainers for Android fuzzing since the kernel source
@@ -399,20 +397,30 @@ func (ctx *linux) Symbolize(rep *Report) error {
 func (ctx *linux) symbolize(rep *Report) error {
 	symb := symbolizer.NewSymbolizer(ctx.config.target)
 	defer symb.Close()
+	symbFunc := func(bin string, pc uint64) ([]symbolizer.Frame, error) {
+		return ctx.symbolizerCache.Symbolize(symb.Symbolize, bin, pc)
+	}
 	var symbolized []byte
-	s := bufio.NewScanner(bytes.NewReader(rep.Report))
 	prefix := rep.reportPrefixLen
-	for s.Scan() {
-		line := append([]byte{}, s.Bytes()...)
-		line = append(line, '\n')
-		newLine := symbolizeLine(symb.Symbolize, ctx.symbols, ctx.vmlinux, ctx.kernelBuildSrc, line)
+	for _, line := range bytes.SplitAfter(rep.Report, []byte("\n")) {
+		line := bytes.Clone(line)
+		newLine := symbolizeLine(symbFunc, ctx.symbols, ctx.vmlinux, ctx.kernelBuildSrc, line)
 		if prefix > len(symbolized) {
 			prefix += len(newLine) - len(line)
 		}
 		symbolized = append(symbolized, newLine...)
 	}
+	oldReport := rep.Report
 	rep.Report = symbolized
+	oldPrefixLen := rep.reportPrefixLen
 	rep.reportPrefixLen = prefix
+
+	if len(rep.Report) > 0 && rep.reportPrefixLen > len(rep.Report) {
+		panic(fmt.Sprintf("invalid reportPrefixLen after symbolize: prefix %d -> %d,"+
+			"report len: %d -> %d, old report: %q",
+			oldPrefixLen, rep.reportPrefixLen, len(oldReport), len(rep.Report), oldReport,
+		))
+	}
 	return nil
 }
 
@@ -571,11 +579,6 @@ func (ctx *linux) decompileWithOffset(parsed parsedOpcodes) (*decompiledOpcodes,
 }
 
 func (ctx *linux) parseOpcodes(codeSlice string) (parsedOpcodes, error) {
-	binaryOps := binary.ByteOrder(binary.BigEndian)
-	if ctx.target.LittleEndian {
-		binaryOps = binary.LittleEndian
-	}
-
 	width := 0
 	bytes := []byte{}
 	trapOffset := -1
@@ -611,11 +614,11 @@ func (ctx *linux) parseOpcodes(codeSlice string) (parsedOpcodes, error) {
 		case 1:
 			extraBytes[0] = byte(number)
 		case 2:
-			binaryOps.PutUint16(extraBytes, uint16(number))
+			ctx.target.HostEndian.PutUint16(extraBytes, uint16(number))
 		case 4:
-			binaryOps.PutUint32(extraBytes, uint32(number))
+			ctx.target.HostEndian.PutUint32(extraBytes, uint32(number))
 		case 8:
-			binaryOps.PutUint64(extraBytes, number)
+			ctx.target.HostEndian.PutUint64(extraBytes, number)
 		default:
 			return parsedOpcodes{}, fmt.Errorf("invalid opcodes string: invalid width %v", width)
 		}
@@ -648,8 +651,12 @@ func (ctx *linux) decompileOpcodes(text []byte, report *Report) []byte {
 	// Iterate over all "Code: " lines and pick the first that could be decompiled
 	// that might be of interest to the user.
 	var decompiled *decompiledOpcodes
-	var prevLine []byte
-	for s := bufio.NewScanner(bytes.NewReader(text)); s.Scan(); prevLine = append([]byte{}, s.Bytes()...) {
+	lines := lines(text)
+	for i, line := range lines {
+		var prevLine []byte
+		if i > 0 {
+			prevLine = lines[i-1]
+		}
 		// We want to avoid decompiling code from user-space as it is not of big interest during
 		// debugging kernel problems.
 		// For now this check only works for x86/amd64, but Linux on other architectures supported
@@ -657,7 +664,7 @@ func (ctx *linux) decompileOpcodes(text []byte, report *Report) []byte {
 		if linuxUserSegmentRe.Match(prevLine) {
 			continue
 		}
-		match := linuxCodeRe.FindSubmatch(s.Bytes())
+		match := linuxCodeRe.FindSubmatch(line)
 		if match == nil {
 			continue
 		}
@@ -721,12 +728,13 @@ func (ctx *linux) extractGuiltyFileRaw(title string, report []byte) string {
 }
 
 func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
-	scanner := bufio.NewScanner(bytes.NewReader(report))
-
 	// Extract the first possible guilty file.
 	guilty := ""
-	for scanner.Scan() {
-		match := filenameRe.FindSubmatch(scanner.Bytes())
+	var line []byte
+	lines := lines(report)
+	for len(lines) > 0 {
+		line, lines = lines[0], lines[1:]
+		match := filenameRe.FindSubmatch(line)
 		if match == nil {
 			continue
 		}
@@ -738,7 +746,7 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 			guilty = string(file)
 		}
 
-		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(scanner.Bytes()) {
+		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(line) {
 			continue
 		}
 		guilty = filepath.Clean(string(file))
@@ -747,13 +755,14 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 
 	// Search for deeper filepaths in the stack trace below the first possible guilty file.
 	deepestPath := filepath.Dir(guilty)
-	for scanner.Scan() {
-		match := filenameRe.FindSubmatch(scanner.Bytes())
+	for len(lines) > 0 {
+		line, lines = lines[0], lines[1:]
+		match := filenameRe.FindSubmatch(line)
 		if match == nil {
 			continue
 		}
 		file := match[1]
-		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(scanner.Bytes()) {
+		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(line) {
 			continue
 		}
 		clean := filepath.Clean(string(file))
@@ -829,7 +838,7 @@ func (ctx *linux) isCorrupted(title string, report []byte, format oopsFormat) (b
 		if match == nil {
 			continue
 		}
-		frames := bytes.Split(report[match[0]:], []byte{'\n'})
+		frames := lines(report[match[0]:])
 		if len(frames) < 4 {
 			return true, "call trace is missed"
 		}
@@ -1259,6 +1268,7 @@ var linuxStackParams = &stackParams{
 		"insert_work",
 		"__queue_delayed_work",
 		"queue_delayed_work_on",
+		"ida_free",
 		// arm64 translation exception handling path.
 		"do_(kernel|translation)_fault",
 		"do_mem_abort",
@@ -1268,6 +1278,9 @@ var linuxStackParams = &stackParams{
 		"xas_(?:start|load|find)",
 		"find_lock_entries",
 		"truncate_inode_pages_range",
+		"__phys_addr",
+		"__fortify_report",
+		"cleanup_srcu_struct",
 	},
 	corruptedLines: []*regexp.Regexp{
 		// Fault injection stacks are frequently intermixed with crash reports.
@@ -1869,10 +1882,12 @@ var linuxOopses = append([]*oops{
 		[]*regexp.Regexp{
 			compile("WARNING: /etc/ssh/moduli does not exist, using fixed modulus"), // printed by sshd
 			compile("WARNING: workqueue cpumask: online intersect > possible intersect"),
-			compile("WARNING: [Tt]he mand mount option (is being|has been) deprecated"),
+			compile("WARNING: [Tt]he mand mount option"),
 			compile("WARNING: Unsupported flag value\\(s\\) of 0x%x in DT_FLAGS_1"), // printed when glibc is dumped
 			compile("WARNING: Unprivileged eBPF is enabled with eIBRS"),
 			compile(`WARNING: fbcon: Driver '(.*)' missed to adjust virtual screen size (\((?:\d+)x(?:\d+) vs\. (?:\d+)x(?:\d+)\))`),
+			compile(`WARNING: See https.* for mitigation options.`),
+			compile(`WARNING: kernel not compiled with CPU_SRSO`),
 		},
 		crash.Warning,
 	},

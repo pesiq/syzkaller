@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/pkg/stats"
+	"github.com/google/syzkaller/pkg/stats/sample"
 )
 
 type BugInfo struct {
@@ -103,12 +103,12 @@ func readBenches(benchFile string) ([]StatRecord, error) {
 
 // The input are stat snapshots of different instances taken at the same time.
 // This function groups those data points per stat types (e.g. exec total, crashes, etc.).
-func groupSamples(records []StatRecord) map[string]*stats.Sample {
-	ret := make(map[string]*stats.Sample)
+func groupSamples(records []StatRecord) map[string]*sample.Sample {
+	ret := make(map[string]*sample.Sample)
 	for _, record := range records {
 		for key, value := range record {
 			if ret[key] == nil {
-				ret[key] = &stats.Sample{}
+				ret[key] = &sample.Sample{}
 			}
 			ret[key].Xs = append(ret[key].Xs, float64(value))
 		}
@@ -243,10 +243,22 @@ func (group RunResultGroup) minResultLength() int {
 	return ret
 }
 
-func (group RunResultGroup) groupNthRecord(i int) map[string]*stats.Sample {
+func (group RunResultGroup) groupNthRecord(i int) map[string]*sample.Sample {
 	records := []StatRecord{}
 	for _, result := range group.SyzManagerResults() {
 		records = append(records, result.StatRecords[i])
+	}
+	return groupSamples(records)
+}
+
+func (group RunResultGroup) groupLastRecord() map[string]*sample.Sample {
+	records := []StatRecord{}
+	for _, result := range group.SyzManagerResults() {
+		n := len(result.StatRecords)
+		if n == 0 {
+			continue
+		}
+		records = append(records, result.StatRecords[n-1])
 	}
 	return groupSamples(records)
 }
@@ -257,6 +269,17 @@ func (view StatView) StatsTable() (*Table, error) {
 
 func (view StatView) AlignedStatsTable(field string) (*Table, error) {
 	// We assume that the stats values are nonnegative.
+	table := NewTable("Property")
+	if field == "" {
+		// Unaligned last records.
+		for _, group := range view.Groups {
+			table.AddColumn(group.Name)
+			for key, sample := range group.groupLastRecord() {
+				table.Set(key, group.Name, NewValueCell(sample))
+			}
+		}
+		return table, nil
+	}
 	var commonValue float64
 	for _, group := range view.Groups {
 		minLen := group.minResultLength()
@@ -273,8 +296,6 @@ func (view StatView) AlignedStatsTable(field string) (*Table, error) {
 			commonValue = currValue
 		}
 	}
-	table := NewTable("Property")
-	cells := make(map[string]map[string]string)
 	for _, group := range view.Groups {
 		table.AddColumn(group.Name)
 		minLen := group.minResultLength()
@@ -283,7 +304,7 @@ func (view StatView) AlignedStatsTable(field string) (*Table, error) {
 			continue
 		}
 		// Unwind the samples so that they are aligned on the field value.
-		var samples map[string]*stats.Sample
+		var samples map[string]*sample.Sample
 		for i := minLen - 1; i >= 0; i-- {
 			candidate := group.groupNthRecord(i)
 			// TODO: consider data interpolation.
@@ -294,9 +315,6 @@ func (view StatView) AlignedStatsTable(field string) (*Table, error) {
 			}
 		}
 		for key, sample := range samples {
-			if _, ok := cells[key]; !ok {
-				cells[key] = make(map[string]string)
-			}
 			table.Set(key, group.Name, NewValueCell(sample))
 		}
 	}
@@ -372,16 +390,16 @@ func (view StatView) GenerateReproDurationTable() (*Table, error) {
 		table.AddColumn(group.Name)
 	}
 	for _, group := range view.Groups {
-		samples := make(map[string]*stats.Sample)
+		samples := make(map[string]*sample.Sample)
 		for _, result := range group.SyzReproResults() {
 			title := result.Input.Title
-			var sample *stats.Sample
-			sample, ok := samples[title]
+			var sampleObj *sample.Sample
+			sampleObj, ok := samples[title]
 			if !ok {
-				sample = &stats.Sample{}
-				samples[title] = sample
+				sampleObj = &sample.Sample{}
+				samples[title] = sampleObj
 			}
-			sample.Xs = append(sample.Xs, result.Duration.Seconds())
+			sampleObj.Xs = append(sampleObj.Xs, result.Duration.Seconds())
 		}
 
 		for title, sample := range samples {
@@ -417,7 +435,19 @@ func (group *RunResultGroup) SaveAvgBenchFile(fileName string) error {
 		return err
 	}
 	defer f.Close()
-	for _, averaged := range group.AvgStatRecords() {
+	// In long runs, we collect a lot of stat samples, which results
+	// in large and slow to load graphs. A subset of 128-256 data points
+	// seems to be a reasonable enough precision.
+	records := group.AvgStatRecords()
+	const targetRecords = 128
+	for len(records) > targetRecords*2 {
+		newRecords := make([]map[string]uint64, 0, len(records)/2)
+		for i := 0; i < len(records); i += 2 {
+			newRecords = append(newRecords, records[i])
+		}
+		records = newRecords
+	}
+	for _, averaged := range records {
 		data, err := json.MarshalIndent(averaged, "", "  ")
 		if err != nil {
 			return err

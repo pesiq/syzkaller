@@ -5,34 +5,44 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
 
+	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/log"
-	"github.com/google/syzkaller/sys/targets"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 )
 
-func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32, error) {
-	if len(mgr.cfg.CovFilter.Functions)+len(mgr.cfg.CovFilter.Files)+len(mgr.cfg.CovFilter.RawPCs) == 0 {
+func (mgr *Manager) CoverageFilter(modules []*cover.KernelModule) []uint64 {
+	execFilter, filter, err := createCoverageFilter(mgr.cfg, modules)
+	if err != nil {
+		log.Fatalf("failed to init coverage filter: %v", err)
+	}
+	mgr.modules = modules
+	mgr.coverFilter = filter
+	return execFilter
+}
+
+func createCoverageFilter(cfg *mgrconfig.Config, modules []*cover.KernelModule) ([]uint64, map[uint64]struct{}, error) {
+	if !cfg.HasCovFilter() {
 		return nil, nil, nil
 	}
 	// Always initialize ReportGenerator because RPCServer.NewInput will need it to filter coverage.
-	rg, err := getReportGenerator(mgr.cfg, mgr.modules)
+	rg, err := getReportGenerator(cfg, modules)
 	if err != nil {
 		return nil, nil, err
 	}
-	pcs := make(map[uint32]uint32)
+	pcs := make(map[uint64]struct{})
 	foreachSymbol := func(apply func(*backend.ObjectUnit)) {
 		for _, sym := range rg.Symbols {
 			apply(&sym.ObjectUnit)
 		}
 	}
-	if err := covFilterAddFilter(pcs, mgr.cfg.CovFilter.Functions, foreachSymbol); err != nil {
+	if err := covFilterAddFilter(pcs, cfg.CovFilter.Functions, foreachSymbol); err != nil {
 		return nil, nil, err
 	}
 	foreachUnit := func(apply func(*backend.ObjectUnit)) {
@@ -40,34 +50,27 @@ func (mgr *Manager) createCoverageFilter() (map[uint32]uint32, map[uint32]uint32
 			apply(&unit.ObjectUnit)
 		}
 	}
-	if err := covFilterAddFilter(pcs, mgr.cfg.CovFilter.Files, foreachUnit); err != nil {
+	if err := covFilterAddFilter(pcs, cfg.CovFilter.Files, foreachUnit); err != nil {
 		return nil, nil, err
 	}
-	if err := covFilterAddRawPCs(pcs, mgr.cfg.CovFilter.RawPCs); err != nil {
+	if err := covFilterAddRawPCs(pcs, cfg.CovFilter.RawPCs); err != nil {
 		return nil, nil, err
-	}
-	if len(pcs) == 0 {
-		return nil, nil, nil
-	}
-	if !mgr.cfg.SysTarget.ExecutorUsesShmem {
-		return nil, nil, fmt.Errorf("coverage filter is only supported for targets that use shmem")
 	}
 	// Copy pcs into execPCs. This is used to filter coverage in the executor.
-	execPCs := make(map[uint32]uint32)
-	for pc, val := range pcs {
-		execPCs[pc] = val
+	execPCs := make([]uint64, 0, len(pcs))
+	for pc := range pcs {
+		execPCs = append(execPCs, pc)
 	}
-	// PCs from CMPs are deleted to calculate `filtered coverage` statistics
-	// in syz-manager.
+	// PCs from CMPs are deleted to calculate `filtered coverage` statistics.
 	for _, sym := range rg.Symbols {
 		for _, pc := range sym.CMPs {
-			delete(pcs, uint32(pc))
+			delete(pcs, pc)
 		}
 	}
 	return execPCs, pcs, nil
 }
 
-func covFilterAddFilter(pcs map[uint32]uint32, filters []string, foreach func(func(*backend.ObjectUnit))) error {
+func covFilterAddFilter(pcs map[uint64]struct{}, filters []string, foreach func(func(*backend.ObjectUnit))) error {
 	res, err := compileRegexps(filters)
 	if err != nil {
 		return err
@@ -79,10 +82,10 @@ func covFilterAddFilter(pcs map[uint32]uint32, filters []string, foreach func(fu
 				// We add both coverage points and comparison interception points
 				// because executor filters comparisons as well.
 				for _, pc := range unit.PCs {
-					pcs[uint32(pc)] = 1
+					pcs[pc] = struct{}{}
 				}
 				for _, pc := range unit.CMPs {
-					pcs[uint32(pc)] = 1
+					pcs[pc] = struct{}{}
 				}
 				used[re] = append(used[re], unit.Name)
 				break
@@ -99,7 +102,7 @@ func covFilterAddFilter(pcs map[uint32]uint32, filters []string, foreach func(fu
 	return nil
 }
 
-func covFilterAddRawPCs(pcs map[uint32]uint32, rawPCsFiles []string) error {
+func covFilterAddRawPCs(pcs map[uint64]struct{}, rawPCsFiles []string) error {
 	re := regexp.MustCompile(`(0x[0-9a-f]+)(?:: (0x[0-9a-f]+))?`)
 	for _, f := range rawPCsFiles {
 		rawFile, err := os.Open(f)
@@ -125,54 +128,14 @@ func covFilterAddRawPCs(pcs map[uint32]uint32, rawPCsFiles []string) error {
 			if match[2] == "" || weight < 1 {
 				weight = 1
 			}
-			pcs[uint32(pc)] = uint32(weight)
+			_ = weight // currently unused
+			pcs[pc] = struct{}{}
 		}
 		if err := s.Err(); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func createCoverageBitmap(target *targets.Target, pcs map[uint32]uint32) []byte {
-	// Return nil if filtering is not used.
-	if len(pcs) == 0 {
-		return nil
-	}
-	start, size := coverageFilterRegion(pcs)
-	log.Logf(0, "coverage filter from 0x%x to 0x%x, size 0x%x, pcs %v", start, start+size, size, len(pcs))
-	// The file starts with two uint32: covFilterStart and covFilterSize,
-	// and a bitmap with size ((covFilterSize>>4)/8+2 bytes follow them.
-	// 8-bit = 1-byte
-	data := make([]byte, 8+((size>>4)/8+2))
-	order := binary.ByteOrder(binary.BigEndian)
-	if target.LittleEndian {
-		order = binary.LittleEndian
-	}
-	order.PutUint32(data, start)
-	order.PutUint32(data[4:], size)
-
-	bitmap := data[8:]
-	for pc := range pcs {
-		// The lowest 4-bit is dropped.
-		pc = uint32(backend.NextInstructionPC(target, uint64(pc)))
-		pc = (pc - start) >> 4
-		bitmap[pc/8] |= (1 << (pc % 8))
-	}
-	return data
-}
-
-func coverageFilterRegion(pcs map[uint32]uint32) (uint32, uint32) {
-	start, end := ^uint32(0), uint32(0)
-	for pc := range pcs {
-		if start > pc {
-			start = pc
-		}
-		if end < pc {
-			end = pc
-		}
-	}
-	return start, end - start
 }
 
 func compileRegexps(regexpStrings []string) ([]*regexp.Regexp, error) {

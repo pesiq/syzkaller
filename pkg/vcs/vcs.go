@@ -48,9 +48,6 @@ type Repo interface {
 	// Returns list of commits and titles of commits that are not found.
 	GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
 
-	// ListRecentCommits returns list of recent commit titles starting from baseCommit.
-	ListRecentCommits(baseCommit string) ([]string, error)
-
 	// ExtractFixTagsFromCommits extracts fixing tags for bugs from git log.
 	// Given email = "user@domain.com", it searches for tags of the form "user+tag@domain.com"
 	// and returns commits with these tags.
@@ -193,8 +190,6 @@ func NewRepo(os, vmType, dir string, opts ...RepoOpt) (Repo, error) {
 	switch os {
 	case targets.Linux:
 		return newLinux(dir, opts, vmType), nil
-	case targets.Akaros:
-		return newAkaros(dir, opts), nil
 	case targets.Fuchsia:
 		return newFuchsia(dir, opts), nil
 	case targets.OpenBSD:

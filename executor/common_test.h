@@ -31,7 +31,7 @@ static long syz_errno(volatile long v)
 // syz_exit(status int32)
 static long syz_exit(volatile long status)
 {
-	_exit(status);
+	doexit(status);
 	return 0;
 }
 #endif
@@ -132,4 +132,35 @@ static int do_sandbox_none(void)
 	loop();
 	return 0;
 }
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_test_fuzzer1
+
+static void fake_crash(const char* name)
+{
+	failmsg("crash", "{{CRASH: %s}}", name);
+	doexit(1);
+}
+
+static long syz_test_fuzzer1(volatile long a, volatile long b, volatile long c)
+{
+	// We probably want something more interesting here.
+	if (a == 1 && b == 1 && c == 1)
+		fake_crash("first bug");
+	if (a == 1 && b == 2 && c == 3)
+		fake_crash("second bug");
+	return 0;
+}
+
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_inject_cover
+static long syz_inject_cover(volatile long a, volatile long b, volatile long c)
+#if SYZ_EXECUTOR
+    ; // defined in executor_test.h
+#else
+{
+	return 0;
+}
+#endif
 #endif

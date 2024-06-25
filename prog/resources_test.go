@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/syzkaller/pkg/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestResourceCtors(t *testing.T) {
@@ -17,7 +18,8 @@ func TestResourceCtors(t *testing.T) {
 	}
 	testEachTarget(t, func(t *testing.T, target *Target) {
 		for _, res := range target.Resources {
-			if len(target.calcResourceCtors(res, true)) == 0 && !strings.HasPrefix(res.Name, "ANY") {
+			if len(target.calcResourceCtors(res, true)) == 0 && !strings.HasPrefix(res.Name, "ANY") &&
+				res.Name != "disabled_resource" {
 				t.Errorf("resource %v can't be created", res.Name)
 			}
 		}
@@ -28,6 +30,9 @@ func TestTransitivelyEnabledCalls(t *testing.T) {
 	testEachTarget(t, func(t *testing.T, target *Target) {
 		calls := make(map[*Syscall]bool)
 		for _, c := range target.Syscalls {
+			if c.Attrs.Disabled {
+				continue
+			}
 			calls[c] = true
 		}
 		enabled, disabled := target.TransitivelyEnabledCalls(calls)
@@ -48,13 +53,11 @@ func TestTransitivelyEnabledCalls(t *testing.T) {
 				}
 			}
 		} else {
-			if len(enabled) != len(target.Syscalls) {
-				t.Errorf("some calls are disabled: %v/%v", len(enabled), len(target.Syscalls))
+			if len(enabled) != len(calls) {
+				t.Errorf("some calls are disabled: %v/%v", len(enabled), len(calls))
 			}
-			if len(disabled) != 0 {
-				for c, reason := range disabled {
-					t.Errorf("disabled %v: %v", c.Name, reason)
-				}
+			for c, reason := range disabled {
+				t.Errorf("disabled %v: %v", c.Name, reason)
 			}
 		}
 	})
@@ -68,6 +71,9 @@ func TestTransitivelyEnabledCallsLinux(t *testing.T) {
 	}
 	calls := make(map[*Syscall]bool)
 	for _, c := range target.Syscalls {
+		if c.Attrs.Disabled {
+			continue
+		}
 		calls[c] = true
 	}
 	delete(calls, target.SyscallMap["epoll_create"])
@@ -91,8 +97,7 @@ func TestTransitivelyEnabledCallsLinux(t *testing.T) {
 		t.Fatalf("disabled %v syscalls, want 8", len(disabled))
 	}
 	for c, reason := range disabled {
-		if !strings.Contains(reason, "no syscalls can create resource fd_epoll,"+
-			" enable some syscalls that can create it [epoll_create epoll_create1]") {
+		if !strings.Contains(reason, "fd_epoll [epoll_create epoll_create1]") {
 			t.Fatalf("%v: wrong disable reason: %v", c.Name, reason)
 		}
 	}
@@ -175,6 +180,9 @@ func testCreateResource(t *testing.T, target *Target, calls map[*Syscall]bool, r
 	r.inGenerateResource = true
 	ct := target.BuildChoiceTable(nil, calls)
 	for call := range calls {
+		if call.Attrs.Disabled {
+			continue
+		}
 		t.Logf("testing call %v", call.Name)
 		ForeachCallType(call, func(typ Type, ctx *TypeCtx) {
 			if res, ok := typ.(*ResourceType); ok && ctx.Dir != DirOut {
@@ -189,4 +197,24 @@ func testCreateResource(t *testing.T, target *Target, calls map[*Syscall]bool, r
 			}
 		})
 	}
+}
+
+func TestPreferPreciseResources(t *testing.T) {
+	target, rs, _ := initRandomTargetTest(t, "test", "64")
+	r := newRand(target, rs)
+	counts := map[string]int{}
+	for i := 0; i < 2000; i++ {
+		s := newState(target, target.DefaultChoiceTable(), nil)
+		calls := r.generateParticularCall(s,
+			target.SyscallMap["test$consume_subtype_of_common"])
+		for _, call := range calls {
+			if call.Meta.Name == "test$consume_subtype_of_common" {
+				continue
+			}
+			counts[call.Meta.Name]++
+		}
+	}
+	assert.Greater(t, counts["test$produce_common"], 70)
+	assert.Greater(t, counts["test$also_produce_common"], 70)
+	assert.Greater(t, counts["test$produce_subtype_of_common"], 1000)
 }

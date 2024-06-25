@@ -70,7 +70,7 @@ mount_attr {
 	userns_fd	align64[fd_userns]
 }
 
-mount_attr_flags = MOUNT_ATTR_RDONLY, MOUNT_ATTR_NOSUID, MOUNT_ATTR_NODEV, MOUNT_ATTR_NOEXEC, MOUNT_ATTR__ATIME, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_IDMAP
+mount_attr_flags = MOUNT_ATTR_IDMAP, fsmount_attr_flags
 mount_attr_propagation_flags = MS_UNBINDABLE, MS_PRIVATE, MS_SLAVE, MS_SHARED
 fsmount_flags = FSMOUNT_CLOEXEC
 fsopen_flags = FSOPEN_CLOEXEC
@@ -79,7 +79,7 @@ fsmount_attr_flags = MOUNT_ATTR_RDONLY, MOUNT_ATTR_NOSUID, MOUNT_ATTR_NODEV, MOU
 move_mount_flags = MOVE_MOUNT_F_SYMLINKS, MOVE_MOUNT_F_AUTOMOUNTS, MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS, MOVE_MOUNT_T_AUTOMOUNTS, MOVE_MOUNT_T_EMPTY_PATH, MOVE_MOUNT_SET_GROUP, MOVE_MOUNT_BENEATH
 fsconfig_flag_params = "dirsync", "lazytime", "mand", "posixacl", "ro", "sync", "async", "nolazytime", "nomand", "rw", "silent"
 
-filesystem = "sysfs", "rootfs", "ramfs", "tmpfs", "devtmpfs", "debugfs", "securityfs", "sockfs", "pipefs", "anon_inodefs", "devpts", "ext3", "ext2", "ext4", "hugetlbfs", "vfat", "ecryptfs", "fuseblk", "fuse", "rpc_pipefs", "nfs", "nfs4", "nfsd", "binfmt_misc", "autofs", "xfs", "jfs", "msdos", "ntfs", "ntfs3", "minix", "hfs", "hfsplus", "qnx4", "ufs", "btrfs", "configfs", "ncpfs", "qnx6", "exofs", "befs", "vxfs", "gfs2", "gfs2meta", "fusectl", "bfs", "nsfs", "efs", "cifs", "efivarfs", "affs", "tracefs", "bdev", "ocfs2", "ocfs2_dlmfs", "hpfs", "proc", "afs", "reiserfs", "jffs2", "romfs", "aio", "sysv", "v7", "udf", "ceph", "pstore", "adfs", "9p", "hostfs", "squashfs", "cramfs", "iso9660", "coda", "nilfs2", "logfs", "overlay", "f2fs", "omfs", "ubifs", "openpromfs", "bpf", "cgroup", "cgroup2", "cpuset", "mqueue", "aufs", "selinuxfs", "dax", "erofs", "virtiofs", "exfat", "binder", "zonefs", "pvfs2", "incremental-fs", "esdfs", "smb3", "gadgetfs"
+filesystem = "sysfs", "rootfs", "ramfs", "tmpfs", "devtmpfs", "debugfs", "securityfs", "sockfs", "pipefs", "anon_inodefs", "devpts", "hugetlbfs", "vfat", "ecryptfs", "fuseblk", "fuse", "rpc_pipefs", "nfs", "nfs4", "nfsd", "binfmt_misc", "autofs", "xfs", "jfs", "msdos", "ntfs", "ntfs3", "minix", "hfs", "hfsplus", "qnx4", "ufs", "btrfs", "configfs", "ncpfs", "qnx6", "exofs", "befs", "vxfs", "gfs2", "gfs2meta", "fusectl", "bfs", "nsfs", "efs", "cifs", "efivarfs", "affs", "tracefs", "bdev", "ocfs2", "ocfs2_dlmfs", "hpfs", "proc", "afs", "reiserfs", "jffs2", "romfs", "aio", "sysv", "v7", "udf", "ceph", "pstore", "adfs", "9p", "hostfs", "squashfs", "cramfs", "iso9660", "coda", "nilfs2", "logfs", "overlay", "f2fs", "omfs", "ubifs", "openpromfs", "bpf", "cgroup", "cgroup2", "cpuset", "mqueue", "aufs", "selinuxfs", "dax", "erofs", "virtiofs", "exfat", "binder", "zonefs", "pvfs2", "incremental-fs", "esdfs", "smb3", "gadgetfs", ext4_types
 
 blockdev_filename [
 	filename	filename
@@ -133,6 +133,7 @@ syz_mount_image$jffs2(fs ptr[in, string["jffs2"]], dir ptr[in, filename], flags 
 syz_mount_image$nilfs2(fs ptr[in, string["nilfs2"]], dir ptr[in, filename], flags flags[mount_flags], opts ptr[in, fs_options[nilfs2_options]], chdir bool8, size len[img], img ptr[in, compressed_image]) fd_dir (timeout[SYZ_MOUNT_IMAGE_TIMEOUT], no_generate, no_minimize)
 syz_mount_image$squashfs(fs ptr[in, string["squashfs"]], dir ptr[in, filename], flags flags[mount_flags], opts ptr[in, fs_options[stringnoz]], chdir bool8, size len[img], img ptr[in, compressed_image]) fd_dir (timeout[SYZ_MOUNT_IMAGE_TIMEOUT], no_generate, no_minimize)
 syz_mount_image$udf(fs ptr[in, string["udf"]], dir ptr[in, filename], flags flags[mount_flags], opts ptr[in, fs_options[udf_options]], chdir bool8, size len[img], img ptr[in, compressed_image]) fd_dir (timeout[SYZ_MOUNT_IMAGE_TIMEOUT], no_generate, no_minimize)
+syz_mount_image$bcachefs(fs ptr[in, string["bcachefs"]], dir ptr[in, filename], flags flags[mount_flags], opts ptr[in, fs_options[bcachefs_options]], chdir bool8, size len[img], img ptr[in, compressed_image]) fd_dir (timeout[SYZ_MOUNT_IMAGE_TIMEOUT], no_generate, no_minimize)
 
 # TODO: zonefs needs a zoned block device:
 # https://elixir.bootlin.com/linux/v6.1-rc6/source/fs/zonefs/super.c#L1768
@@ -965,6 +966,19 @@ esdfs_options [
 ] [varlen]
 
 esdfs_derive = "none", "legacy", "unified", "multi", "public"
+
+bcachefs_options [
+	metadata_checksum	fs_opt["metadata_checksum", stringnoz[bcachefs_checksum]]
+	data_checksum		fs_opt["data_checksum", stringnoz[bcachefs_checksum]]
+	compression		fs_opt["compression", stringnoz[bcachefs_compression]]
+	background_compression	fs_opt["background_compression", stringnoz[bcachefs_compression]]
+	str_hash		fs_opt["str_hash", stringnoz[bcachefs_str_hash]]
+	nocow			stringnoz["nocow"]
+] [varlen]
+
+bcachefs_checksum = "none", "crc32c", "crc64", "xxhash"
+bcachefs_compression = "none", "lz4", "gzip", "zstd"
+bcachefs_str_hash = "crc32c", "crc64", "siphash"
 
 cgroup_options [
 	all		stringnoz["all"]

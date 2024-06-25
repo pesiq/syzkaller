@@ -8,11 +8,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +29,6 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
-	"golang.org/x/net/context"
 	"google.golang.org/appengine/v2/aetest"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
@@ -51,7 +52,7 @@ var skipDevAppserverTests = func() bool {
 	_, err := exec.LookPath("dev_appserver.py")
 	// Don't silently skip tests on CI, we should have gcloud sdk installed there.
 	return err != nil && os.Getenv("SYZ_ENV") == "" ||
-		os.Getenv("SYZ_SKIP_DASHBOARD") != ""
+		os.Getenv("SYZ_SKIP_DEV_APPSERVER_TESTS") != ""
 }()
 
 func NewCtx(t *testing.T) *Ctx {
@@ -274,6 +275,17 @@ func (c *Ctx) decommission(ns string) {
 	}
 }
 
+func (c *Ctx) setWaitForRepro(ns string, d time.Duration) {
+	c.transformContext = func(c context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+			ret := *cfg
+			ret.WaitForRepro = d
+			return &ret
+		})
+		return contextWithConfig(c, newConfig)
+	}
+}
+
 // GET sends admin-authorized HTTP GET request to the app.
 func (c *Ctx) GET(url string) ([]byte, error) {
 	return c.AuthGET(AccessAdmin, url)
@@ -281,7 +293,7 @@ func (c *Ctx) GET(url string) ([]byte, error) {
 
 // AuthGET sends HTTP GET request to the app with the specified authorization.
 func (c *Ctx) AuthGET(access AccessLevel, url string) ([]byte, error) {
-	w, err := c.httpRequest("GET", url, "", access)
+	w, err := c.httpRequest("GET", url, "", "", access)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +302,17 @@ func (c *Ctx) AuthGET(access AccessLevel, url string) ([]byte, error) {
 
 // POST sends admin-authorized HTTP POST requestd to the app.
 func (c *Ctx) POST(url, body string) ([]byte, error) {
-	w, err := c.httpRequest("POST", url, body, AccessAdmin)
+	w, err := c.httpRequest("POST", url, body, "", AccessAdmin)
+	if err != nil {
+		return nil, err
+	}
+	return w.Body.Bytes(), nil
+}
+
+// POST sends an admin-authorized HTTP POST form to the app.
+func (c *Ctx) POSTForm(url string, form url.Values) ([]byte, error) {
+	w, err := c.httpRequest("POST", url, form.Encode(),
+		"application/x-www-form-urlencoded", AccessAdmin)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +321,7 @@ func (c *Ctx) POST(url, body string) ([]byte, error) {
 
 // ContentType returns the response Content-Type header value.
 func (c *Ctx) ContentType(url string) (string, error) {
-	w, err := c.httpRequest("HEAD", url, "", AccessAdmin)
+	w, err := c.httpRequest("HEAD", url, "", "", AccessAdmin)
 	if err != nil {
 		return "", err
 	}
@@ -310,13 +332,17 @@ func (c *Ctx) ContentType(url string) (string, error) {
 	return values[0], nil
 }
 
-func (c *Ctx) httpRequest(method, url, body string, access AccessLevel) (*httptest.ResponseRecorder, error) {
+func (c *Ctx) httpRequest(method, url, body, contentType string,
+	access AccessLevel) (*httptest.ResponseRecorder, error) {
 	c.t.Logf("%v: %v", method, url)
 	r, err := c.inst.NewRequest(method, url, strings.NewReader(body))
 	if err != nil {
 		c.t.Fatal(err)
 	}
 	r.Header.Add("X-Appengine-User-IP", "127.0.0.1")
+	if contentType != "" {
+		r.Header.Add("Content-Type", contentType)
+	}
 	r = registerRequest(r, c)
 	r = r.WithContext(c.transformContext(r.Context()))
 	if access == AccessAdmin || access == AccessUser {
@@ -666,7 +692,7 @@ func registerRequest(r *http.Request, c *Ctx) *http.Request {
 	defer requestMu.Unlock()
 
 	requestNum++
-	newContext := context.WithValue(r.Context(), requestIDKey, requestNum)
+	newContext := context.WithValue(r.Context(), requestIDKey{}, requestNum)
 	newRequest := r.WithContext(newContext)
 	requestContexts = append(requestContexts, RequestMapping{requestNum, c})
 	return newRequest
@@ -698,10 +724,10 @@ func unregisterContext(c *Ctx) {
 	requestContexts = requestContexts[:n]
 }
 
-const requestIDKey = "test_request_id"
+type requestIDKey struct{}
 
 func getRequestID(c context.Context) int {
-	val, ok := c.Value(requestIDKey).(int)
+	val, ok := c.Value(requestIDKey{}).(int)
 	if !ok {
 		panic("the context did not come from a test")
 	}

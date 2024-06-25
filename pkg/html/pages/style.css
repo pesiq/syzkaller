@@ -180,14 +180,14 @@ table td, table th {
 }
 
 .list_table .stat_name {
-	width: 150pt;
-	max-width: 150pt;
+	width: 180pt;
+	max-width: 180pt;
 	font-family: monospace;
 }
 
 .list_table .stat_value {
-	width: 120pt;
-	max-width: 120pt;
+	width: 200pt;
+	max-width: 200pt;
 	font-family: monospace;
 }
 
@@ -354,6 +354,11 @@ aside {
 	margin-bottom: 7px;
 }
 
+.input-values textarea {
+	width: 750pt;
+	height: 250pt;
+}
+
 .input-group {
 	margin-top: 7px;
 	margin-bottom: 7px;
@@ -408,4 +413,16 @@ aside {
 
 .collapsible-show .show-icon {
 	display: none;
+}
+
+.emergency-stop {
+	background-color: yellow;
+	padding: 5pt;
+	margin-bottom: 5pt;
+}
+
+.emergency-stopped {
+	background-color: coral;
+	padding: 5pt;
+	margin-bottom: 5pt;
 }

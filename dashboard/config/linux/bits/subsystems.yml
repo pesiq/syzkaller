@@ -26,8 +26,8 @@ config:
  - NUMA_EMU: [x86_64]
  - NUMA_BALANCING: [-arm]
  - NUMA_BALANCING_DEFAULT_ENABLED: [-arm]
- - ADDRESS_MASKING: [x86_64, linux-next]
- - X86_USER_SHADOW_STACK: [x86_64, linux-next]
+ - ADDRESS_MASKING: [x86_64, v6.4]
+ - X86_USER_SHADOW_STACK: [x86_64, v6.6]
  # KMSAN disables HYPERVISOR_GUEST which is required to enable this.
  - X86_X2APIC: [x86_64, -kmsan]
  - CGROUPS
@@ -70,7 +70,9 @@ config:
  - KVM_AMD: [x86_64]
  - KVM_XEN: [x86_64, v5.12]
  - KVM_PROVE_MMU: [x86_64, v6.6]
-   # KMSAN disables HYPERVISOR_GUEST which is required to enable X86_X2APIC
+ - KVM_SW_PROTECTED_VM: [x86_64, linux-next]
+ - KVM_HYPERV: [x86_64, linux-next]
+ # KMSAN disables HYPERVISOR_GUEST which is required to enable X86_X2APIC
  # which is required to enable this.
  - X86_SGX: [x86_64, v5.11, -kmsan]
  - X86_SGX_KVM: [x86_64, v6.0, -kmsan]
@@ -105,6 +107,7 @@ config:
  - CMA
  - MEM_SOFT_DIRTY: [x86_64]
  - ZSWAP
+ - ZSWAP_SHRINKER_DEFAULT_ON: [v6.8]
  - ZSMALLOC
  - IDLE_PAGE_TRACKING: [-v5.15]
  - ZONE_DEVICE: [-arm, -riscv, -s390]
@@ -186,15 +189,15 @@ config:
  - ATA
  - SATA_AHCI
  - ATA_PIIX
- - PATA_AMD
+ - PATA_AMD: [-s390]
  - PATA_OLDPIIX
  - PATA_SCH
  - ATA_SFF
  - ATA_BMDMA
  - ATA_GENERIC
  - MD
- - MD_LINEAR
- - MD_MULTIPATH
+ - MD_LINEAR: [-v6.8]
+ - MD_MULTIPATH: [-v6.8]
  - BCACHE
  - BLK_DEV_DM
  - DM_CRYPT
@@ -282,7 +285,9 @@ config:
  # Workaround: select small driver that selects DRM_DISPLAY_HELPER required by
  # DRM_DP_AUX_CHARDEV. Only works with architectures that have CONFIG_PM.
  - DRM_PANEL_EDP: [v5.16, -s390]
- - DRM_DP_AUX_CHARDEV: [x86_64]
+ - DRM_DP_AUX_CHARDEV: [x86_64, -v6.10]
+ - DRM_DISPLAY_DP_AUX_BUS: [linux-next]
+ - DRM_DISPLAY_DP_HELPER: [v5.19, -s390]
  - DRM_DEBUG_MM
  - DRM_I915: [x86_64]
  - DRM_VGEM
@@ -496,8 +501,6 @@ config:
  - FUSE_DAX: [v5.10, x86_64]
  - CUSE
  - VIRTIO_FS
- - FSCACHE
- - CACHEFILES
  - PROC_KCORE: [-arm]
  - TMPFS
  - TMPFS_POSIX_ACL
@@ -582,7 +585,8 @@ config:
  - DAMON: [v5.15]
  - DAMON_VADDR: [v5.15]
  - DAMON_PADDR: [v5.16]
- - DAMON_DBGFS: [v5.15]
+ # DAMON_DBGFS is getting deprecated in v6.9.
+ - DAMON_DBGFS: [v5.15, -v6.9]
  - DAMON_RECLAIM: [v5.17]
  - ZSWAP_DEFAULT_ON: [v5.7]
 

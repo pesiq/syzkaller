@@ -21,6 +21,7 @@ import (
 	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
 )
 
 var flagUpdate = flag.Bool("update", false, "update test files accordingly to current results")
@@ -147,10 +148,10 @@ func testParseImpl(t *testing.T, reporter *Reporter, test *ParseTest) {
 	containsCrash := reporter.ContainsCrash(test.Log)
 	expectCrash := (test.Title != "")
 	if expectCrash && !containsCrash {
-		t.Fatalf("ContainsCrash did not find crash")
+		t.Fatalf("did not find crash")
 	}
 	if !expectCrash && containsCrash {
-		t.Fatalf("ContainsCrash found unexpected crash")
+		t.Fatalf("found unexpected crash")
 	}
 	if rep != nil && rep.Title == "" {
 		t.Fatalf("found crash, but title is empty")
@@ -184,7 +185,7 @@ func testParseImpl(t *testing.T, reporter *Reporter, test *ParseTest) {
 			wantAltTitles += "ALT: " + t + "\n"
 		}
 		t.Fatalf("want:\nTITLE: %s\n%sTYPE: %v\nFRAME: %v\nCORRUPTED: %v\nSUPPRESSED: %v\n"+
-			"got:\nTITLE: %s\n%sTYPE: %v\nFRAME: %v\nCORRUPTED: %v (%v)\nSUPPRESSED: %v\n",
+			"got:\nTITLE: %s\n%sTYPE: %v\nFRAME: %v\nCORRUPTED: %v (%v)\nSUPPRESSED: %v",
 			test.Title, wantAltTitles, test.Type, test.Frame, test.Corrupted, test.Suppressed,
 			title, gotAltTitles, typ, frame, corrupted, corruptedReason, suppressed)
 	}
@@ -205,13 +206,13 @@ func checkReport(t *testing.T, reporter *Reporter, rep *Report, test *ParseTest)
 		t.Fatalf("bad Output:\n%s", rep.Output)
 	}
 	if rep.StartPos != 0 && rep.EndPos != 0 && rep.StartPos >= rep.EndPos {
-		t.Fatalf("StartPos=%v >= EndPos=%v", rep.StartPos, rep.EndPos)
+		t.Fatalf("StartPos %v >= EndPos %v", rep.StartPos, rep.EndPos)
 	}
 	if rep.EndPos > len(rep.Output) {
-		t.Fatalf("EndPos=%v > len(Output)=%v", rep.EndPos, len(rep.Output))
+		t.Fatalf("EndPos %v > len(Output) %v", rep.EndPos, len(rep.Output))
 	}
 	if rep.SkipPos <= rep.StartPos || rep.SkipPos > rep.EndPos {
-		t.Fatalf("bad SkipPos=%v: StartPos=%v EndPos=%v", rep.SkipPos, rep.StartPos, rep.EndPos)
+		t.Fatalf("bad SkipPos %v: StartPos %v EndPos %v", rep.SkipPos, rep.StartPos, rep.EndPos)
 	}
 	if test.StartLine != "" {
 		if test.EndLine == "" {
@@ -429,4 +430,18 @@ func TestFuzz(t *testing.T) {
 	} {
 		Fuzz([]byte(data)[:len(data):len(data)])
 	}
+}
+
+func TestTruncate(t *testing.T) {
+	assert.Equal(t, []byte(`01234
+
+<<cut 11 bytes out>>`), Truncate([]byte(`0123456789ABCDEF`), 5, 0))
+	assert.Equal(t, []byte(`<<cut 11 bytes out>>
+
+BCDEF`), Truncate([]byte(`0123456789ABCDEF`), 0, 5))
+	assert.Equal(t, []byte(`0123
+
+<<cut 9 bytes out>>
+
+DEF`), Truncate([]byte(`0123456789ABCDEF`), 4, 3))
 }

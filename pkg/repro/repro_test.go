@@ -13,12 +13,14 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/pkg/csource"
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/google/syzkaller/vm"
 )
 
 func initTest(t *testing.T) (*rand.Rand, int) {
@@ -63,7 +65,7 @@ func TestBisect(t *testing.T) {
 			}
 			return guilty == numGuilty, nil
 		})
-		if numGuilty > 8 && len(progs) == 0 {
+		if numGuilty > 6 && len(progs) == 0 {
 			// Bisection has been aborted.
 			continue
 		}
@@ -90,7 +92,6 @@ func TestSimplifies(t *testing.T) {
 		Cgroups:      true,
 		UseTmpDir:    true,
 		HandleSegv:   true,
-		Repro:        true,
 	}
 	var check func(opts csource.Options, i int)
 	check = func(opts csource.Options, i int) {
@@ -133,11 +134,11 @@ func (tei *testExecInterface) Close() {}
 
 func (tei *testExecInterface) RunCProg(p *prog.Prog, duration time.Duration,
 	opts csource.Options) (*instance.RunResult, error) {
-	return tei.RunSyzProg(p.Serialize(), duration, opts)
+	return tei.RunSyzProg(p.Serialize(), duration, opts, instance.SyzExitConditions)
 }
 
 func (tei *testExecInterface) RunSyzProg(syzProg []byte, duration time.Duration,
-	opts csource.Options) (*instance.RunResult, error) {
+	opts csource.Options, exitCondition vm.ExitCondition) (*instance.RunResult, error) {
 	return tei.run(syzProg)
 }
 
@@ -158,7 +159,7 @@ func prepareTestCtx(t *testing.T, log string) *context {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, err := prepareCtx([]byte(log), mgrConfig, nil, reporter, 3)
+	ctx, err := prepareCtx([]byte(log), mgrConfig, flatrpc.AllFeatures, reporter, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,5 +257,40 @@ func TestTooManyErrors(t *testing.T) {
 	_, _, err := ctx.run()
 	if err == nil {
 		t.Fatalf("expected an error")
+	}
+}
+
+func TestProgConcatenation(t *testing.T) {
+	// Since the crash condition is alarm() after pause(), the code
+	// would have to work around the prog.MaxCall limitation.
+	execLog := "2015/12/21 12:18:05 executing program 1:\n"
+	for i := 0; i < prog.MaxCalls; i++ {
+		if i == 10 {
+			execLog += "pause()\n"
+		} else {
+			execLog += "getpid()\n"
+		}
+	}
+	execLog += "2015/12/21 12:18:10 executing program 2:\n"
+	for i := 0; i < prog.MaxCalls; i++ {
+		if i == 10 {
+			execLog += "alarm(0xa)\n"
+		} else {
+			execLog += "getpid()\n"
+		}
+	}
+	ctx := prepareTestCtx(t, execLog)
+	go generateTestInstances(ctx, 3, &testExecInterface{
+		t:   t,
+		run: testExecRunner,
+	})
+	result, _, err := ctx.run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(`pause()
+alarm(0xa)
+`, string(result.Prog.Serialize())); diff != "" {
+		t.Fatal(diff)
 	}
 }

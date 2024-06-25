@@ -18,7 +18,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
 	# Needed for building Cuttlefish images.
 	rsync libarchive-tools \
 	# Needed for buiding gVisor.
-	crossbuild-essential-amd64 crossbuild-essential-arm64
+	crossbuild-essential-amd64 crossbuild-essential-arm64 libbpf-dev
 RUN test "$(uname -m)" != x86_64 && exit 0 || \
         DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
 	  libc6-dev-i386 libc6-dev-i386-amd64-cross lib32gcc-12-dev lib32stdc++-12-dev \
@@ -26,7 +26,7 @@ RUN test "$(uname -m)" != x86_64 && exit 0 || \
 	  g++-arm-linux-gnueabi g++-aarch64-linux-gnu g++-powerpc64le-linux-gnu \
 	  g++-mips64el-linux-gnuabi64 g++-s390x-linux-gnu g++-riscv64-linux-gnu
 
-RUN curl https://dl.google.com/go/go1.20.1.linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -C /usr/local -xz
+RUN curl https://dl.google.com/go/go1.21.4.linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/').tar.gz | tar -C /usr/local -xz
 ENV PATH /usr/local/go/bin:$PATH
 
 # The default clang-14 is too old, install the latest one.
@@ -45,13 +45,14 @@ RUN sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm
 RUN sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-15 100
 RUN sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-15 100
 RUN sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-15 100
+RUN sudo update-alternatives --install /usr/bin/llvm-addr2line llvm-addr2line /usr/bin/llvm-addr2line-15 100
 
 # Not really GRTE, but it's enough to run some scripts that hardcode the path.
 RUN mkdir -p /usr/grte/v5/bin && ln -s /usr/bin/python3 /usr/grte/v5/bin/python2.7
 
 # Install bazel
 # Download the official bazel binary. The APT repository isn't used because there is not packages for arm64.
-RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/6.2.0/release/bazel-6.2.0-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
+RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/7.1.2/release/bazel-7.1.2-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
 
 # Install qemu from the backports.
 # The currently stable version (7.4) cannot properly run arm64-MTE kernels.
@@ -68,3 +69,5 @@ RUN test "$(uname -m)" != x86_64 && exit 0 || \
 # pkg/osutil uses syzkaller user for sandboxing.
 RUN useradd --create-home syzkaller
 RUN echo "export PS1='\n\W🤖 '" >> /root/.bashrc
+
+COPY run-syz-command.sh /run-syz-command.sh

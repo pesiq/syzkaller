@@ -11,28 +11,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/mail"
-	"net/url"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/auth"
 )
 
 type Dashboard struct {
-	Client string
-	Addr   string
-	Key    string
-	ctor   RequestCtor
-	doer   RequestDoer
-	logger RequestLogger
-	// Yes, we have the ability to set custom constructor, doer and logger, but
-	// there are also cases when we just want to mock the whole request processing.
-	// Implementing that on top of http.Request/http.Response would complicate the
-	// code too much.
-	mocker       RequestMocker
+	Client       string
+	Addr         string
+	Key          string
+	ctor         RequestCtor
+	doer         RequestDoer
+	logger       RequestLogger
 	errorHandler func(error)
 }
 
@@ -40,17 +34,10 @@ func New(client, addr, key string) (*Dashboard, error) {
 	return NewCustom(client, addr, key, http.NewRequest, http.DefaultClient.Do, nil, nil)
 }
 
-func NewMock(mocker RequestMocker) *Dashboard {
-	return &Dashboard{
-		mocker: mocker,
-	}
-}
-
 type (
 	RequestCtor   func(method, url string, body io.Reader) (*http.Request, error)
 	RequestDoer   func(req *http.Request) (*http.Response, error)
 	RequestLogger func(msg string, args ...interface{})
-	RequestMocker func(method string, req, resp interface{}) error
 )
 
 // key == "" indicates that the ambient GCE service account authority
@@ -329,9 +316,11 @@ type Crash struct {
 	Assets      []NewAsset
 	GuiltyFiles []string
 	// The following is optional and is filled only after repro.
-	ReproOpts []byte
-	ReproSyz  []byte
-	ReproC    []byte
+	ReproOpts     []byte
+	ReproSyz      []byte
+	ReproC        []byte
+	ReproLog      []byte
+	OriginalTitle string // Title before we began bug reproduction.
 }
 
 type ReportCrashResp struct {
@@ -368,6 +357,23 @@ func (dash *Dashboard) NeedRepro(crash *CrashID) (bool, error) {
 // ReportFailedRepro notifies dashboard about a failed repro attempt for the crash.
 func (dash *Dashboard) ReportFailedRepro(crash *CrashID) error {
 	return dash.Query("report_failed_repro", crash, nil)
+}
+
+type LogToReproReq struct {
+	BuildID string
+}
+
+type LogToReproResp struct {
+	Title    string
+	CrashLog []byte
+}
+
+// LogToRepro are crash logs for older bugs that need to be reproduced on the
+// querying instance.
+func (dash *Dashboard) LogToRepro(req *LogToReproReq) (*LogToReproResp, error) {
+	resp := new(LogToReproResp)
+	err := dash.Query("log_to_repro", req, resp)
+	return resp, err
 }
 
 type LogEntry struct {
@@ -487,6 +493,8 @@ type BisectResult struct {
 	CrashReportLink string
 	Fix             bool
 	CrossTree       bool
+	// In case a missing backport was backported.
+	Backported *Commit
 }
 
 type BugListReport struct {
@@ -505,6 +513,7 @@ type BugListReport struct {
 
 type BugListReportStats struct {
 	Reported int
+	LowPrio  int
 	Fixed    int
 }
 
@@ -730,6 +739,10 @@ type ManagerStatsReq struct {
 	Crashes           uint64
 	SuppressedCrashes uint64
 	Execs             uint64
+
+	// Non-zero only when set.
+	TriagedCoverage uint64
+	TriagedPCs      uint64
 }
 
 func (dash *Dashboard) UploadManagerStats(req *ManagerStatsReq) error {
@@ -919,9 +932,6 @@ func (dash *Dashboard) Query(method string, req, reply interface{}) error {
 	if dash.logger != nil {
 		dash.logger("API(%v): %#v", method, req)
 	}
-	if dash.mocker != nil {
-		return dash.mocker(method, req, reply)
-	}
 	err := dash.queryImpl(method, req, reply)
 	if err != nil {
 		if dash.logger != nil {
@@ -949,30 +959,43 @@ func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
 		}
 		reflect.ValueOf(reply).Elem().Set(reflect.New(typ.Elem()).Elem())
 	}
-	values := make(url.Values)
-	values.Add("client", dash.Client)
-	values.Add("key", dash.Key)
-	values.Add("method", method)
+	body := &bytes.Buffer{}
+	mWriter := multipart.NewWriter(body)
+	err := mWriter.WriteField("client", dash.Client)
+	if err != nil {
+		return err
+	}
+	err = mWriter.WriteField("key", dash.Key)
+	if err != nil {
+		return err
+	}
+	err = mWriter.WriteField("method", method)
+	if err != nil {
+		return err
+	}
 	if req != nil {
+		w, err := mWriter.CreateFormField("payload")
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(req)
 		if err != nil {
 			return fmt.Errorf("failed to marshal request: %w", err)
 		}
-		buf := new(bytes.Buffer)
-		gz := gzip.NewWriter(buf)
+		gz := gzip.NewWriter(w)
 		if _, err := gz.Write(data); err != nil {
 			return err
 		}
 		if err := gz.Close(); err != nil {
 			return err
 		}
-		values.Add("payload", buf.String())
 	}
-	r, err := dash.ctor("POST", fmt.Sprintf("%v/api", dash.Addr), strings.NewReader(values.Encode()))
+	mWriter.Close()
+	r, err := dash.ctor("POST", fmt.Sprintf("%v/api", dash.Addr), body)
 	if err != nil {
 		return err
 	}
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("Content-Type", mWriter.FormDataContentType())
 	resp, err := dash.doer(r)
 	if err != nil {
 		return fmt.Errorf("http request failed: %w", err)

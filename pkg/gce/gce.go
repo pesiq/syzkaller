@@ -12,15 +12,16 @@
 package gce
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
@@ -30,6 +31,7 @@ import (
 type Context struct {
 	ProjectID  string
 	ZoneID     string
+	RegionID   string
 	Instance   string
 	InternalIP string
 	ExternalIP string
@@ -81,6 +83,13 @@ func NewContext(customZoneID string) (*Context, error) {
 		ctx.ZoneID = customZoneID
 	} else {
 		ctx.ZoneID = myZoneID
+	}
+	if !validateZone(ctx.ZoneID) {
+		return nil, fmt.Errorf("%q is not a valid zone name", ctx.ZoneID)
+	}
+	ctx.RegionID = zoneToRegion(ctx.ZoneID)
+	if ctx.RegionID == "" {
+		return nil, fmt.Errorf("failed to extract region id from %s", ctx.ZoneID)
 	}
 	ctx.Instance, err = ctx.getMeta("instance/name")
 	if err != nil {
@@ -170,7 +179,7 @@ retry:
 	if err != nil {
 		return "", fmt.Errorf("failed to create instance: %w", err)
 	}
-	if err := ctx.waitForCompletion("zone", "create image", op.Name, false); err != nil {
+	if err := ctx.waitForCompletion("zone", "create instance", op.Name, false); err != nil {
 		var resourcePoolExhaustedError resourcePoolExhaustedError
 		if errors.As(err, &resourcePoolExhaustedError) && instance.Scheduling.Preemptible {
 			instance.Scheduling.Preemptible = false
@@ -318,7 +327,8 @@ func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound b
 			if op.Error != nil {
 				reason := ""
 				for _, operr := range op.Error.Errors {
-					if operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED" {
+					if operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED" ||
+						operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS" {
 						return resourcePoolExhaustedError(fmt.Sprintf("%+v", operr))
 					}
 					if ignoreNotFound && operr.Code == "RESOURCE_NOT_FOUND" {
@@ -371,4 +381,16 @@ func (ctx *Context) apiCall(fn func() error) error {
 		}
 		return err
 	}
+}
+
+var zoneNameRe = regexp.MustCompile("^[a-zA-Z0-9]*-[a-zA-Z0-9]*[-][a-zA-Z0-9]*$")
+
+func validateZone(zone string) bool {
+	return zoneNameRe.MatchString(zone)
+}
+
+var regionNameRe = regexp.MustCompile("^[a-zA-Z0-9]*-[a-zA-Z0-9]*")
+
+func zoneToRegion(zone string) string {
+	return regionNameRe.FindString(zone)
 }

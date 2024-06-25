@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"text/template"
 
@@ -41,7 +42,6 @@ type Define struct {
 type ArchData struct {
 	Revision   string
 	ForkServer int
-	Shmem      int
 	GOARCH     string
 	PageSize   uint64
 	NumPages   uint64
@@ -89,6 +89,18 @@ func main() {
 			os.Exit(1)
 		}
 		osutil.MkdirAll(filepath.Join(*outDir, "sys", OS, "gen"))
+
+		// Cleanup old files in the case set of architectures has chnaged.
+		allFiles, err := filepath.Glob(filepath.Join(*outDir, "sys", OS, "gen", "*.go"))
+		if err != nil {
+			tool.Failf("failed to glob: %v", err)
+		}
+		for _, file := range allFiles {
+			if strings.HasSuffix(file, "empty.go") {
+				continue
+			}
+			os.Remove(file)
+		}
 
 		var archs []string
 		for arch := range targets.List[OS] {
@@ -179,6 +191,19 @@ type Job struct {
 }
 
 func processJob(job *Job, descriptions *ast.Description, constFile *compiler.ConstFile) {
+	var flags []prog.FlagDesc
+	for _, decl := range descriptions.Nodes {
+		switch n := decl.(type) {
+		case *ast.IntFlags:
+			var flag prog.FlagDesc
+			flag.Name = n.Name.Name
+			for _, val := range n.Values {
+				flag.Values = append(flag.Values, val.Ident)
+			}
+			flags = append(flags, flag)
+		}
+	}
+
 	eh := func(pos ast.Pos, msg string) {
 		job.Errors = append(job.Errors, fmt.Sprintf("%v: %v\n", pos, msg))
 	}
@@ -193,7 +218,7 @@ func processJob(job *Job, descriptions *ast.Description, constFile *compiler.Con
 
 	sysFile := filepath.Join(*outDir, "sys", job.Target.OS, "gen", job.Target.Arch+".go")
 	out := new(bytes.Buffer)
-	generate(job.Target, prog, consts, out)
+	generate(job.Target, prog, consts, flags, out)
 	rev := hash.String(out.Bytes())
 	fmt.Fprintf(out, "const revision_%v = %q\n", job.Target.Arch, rev)
 	writeSource(sysFile, out.Bytes())
@@ -210,7 +235,8 @@ func processJob(job *Job, descriptions *ast.Description, constFile *compiler.Con
 	job.OK = len(job.Errors) == 0
 }
 
-func generate(target *targets.Target, prg *compiler.Prog, consts map[string]uint64, out io.Writer) {
+func generate(target *targets.Target, prg *compiler.Prog, consts map[string]uint64, flags []prog.FlagDesc,
+	out io.Writer) {
 	tag := fmt.Sprintf("syz_target,syz_os_%v,syz_arch_%v", target.OS, target.Arch)
 	if target.VMArch != "" {
 		tag += fmt.Sprintf(" syz_target,syz_os_%v,syz_arch_%v", target.OS, target.VMArch)
@@ -225,12 +251,12 @@ func generate(target *targets.Target, prg *compiler.Prog, consts map[string]uint
 	fmt.Fprintf(out, "func init() {\n")
 	fmt.Fprintf(out, "\tRegisterTarget(&Target{"+
 		"OS: %q, Arch: %q, Revision: revision_%v, PtrSize: %v, PageSize: %v, "+
-		"NumPages: %v, DataOffset: %v, LittleEndian: %v, ExecutorUsesShmem: %v, "+
-		"Syscalls: syscalls_%v, Resources: resources_%v, Consts: consts_%v}, "+
-		"types_%v, InitTarget)\n}\n\n",
+		"NumPages: %v, DataOffset: %v, BigEndian: %v, "+
+		"Syscalls: syscalls_%v, Resources: resources_%v, Consts: consts_%v,"+
+		"Flags: flags_%v}, types_%v, InitTarget)\n}\n\n",
 		target.OS, target.Arch, target.Arch, target.PtrSize, target.PageSize,
-		target.NumPages, target.DataOffset, target.LittleEndian, target.ExecutorUsesShmem,
-		target.Arch, target.Arch, target.Arch, target.Arch)
+		target.NumPages, target.DataOffset, target.BigEndian,
+		target.Arch, target.Arch, target.Arch, target.Arch, target.Arch)
 
 	fmt.Fprintf(out, "var resources_%v = ", target.Arch)
 	serializer.Write(out, prg.Resources)
@@ -242,6 +268,10 @@ func generate(target *targets.Target, prg *compiler.Prog, consts map[string]uint
 
 	fmt.Fprintf(out, "var types_%v = ", target.Arch)
 	serializer.Write(out, prg.Types)
+	fmt.Fprintf(out, "\n\n")
+
+	fmt.Fprintf(out, "var flags_%v = ", target.Arch)
+	serializer.Write(out, flags)
 	fmt.Fprintf(out, "\n\n")
 
 	constArr := make([]prog.ConstValue, 0, len(consts))
@@ -266,9 +296,6 @@ func generateExecutorSyscalls(target *targets.Target, syscalls []*prog.Syscall, 
 	}
 	if target.ExecutorUsesForkServer {
 		data.ForkServer = 1
-	}
-	if target.ExecutorUsesShmem {
-		data.Shmem = 1
 	}
 	defines := make(map[string]string)
 	for _, c := range syscalls {
@@ -324,8 +351,10 @@ func newSyscallData(target *targets.Target, sc *prog.Syscall, attrs []uint64) Sy
 		Name:     sc.Name,
 		CallName: callName,
 		NR:       int32(sc.NR),
-		NeedCall: (!target.HasCallNumber(sc.CallName) || patchCallName) && !sc.Attrs.Disabled,
-		Attrs:    attrs,
+		NeedCall: (!target.HasCallNumber(sc.CallName) || patchCallName) &&
+			// These are declared in the compiler for internal purposes.
+			!strings.HasPrefix(sc.Name, "syz_builtin"),
+		Attrs: attrs,
 	}
 }
 
@@ -384,7 +413,6 @@ struct call_props_t { {{range $attr := $.CallProps}}
 #define GOARCH "{{.GOARCH}}"
 #define SYZ_REVISION "{{.Revision}}"
 #define SYZ_EXECUTOR_USES_FORK_SERVER {{.ForkServer}}
-#define SYZ_EXECUTOR_USES_SHMEM {{.Shmem}}
 #define SYZ_PAGE_SIZE {{.PageSize}}
 #define SYZ_NUM_PAGES {{.NumPages}}
 #define SYZ_DATA_OFFSET {{.DataOffset}}

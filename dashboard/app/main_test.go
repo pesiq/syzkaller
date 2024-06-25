@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/context"
 )
 
 func TestOnlyManagerFilter(t *testing.T) {
@@ -404,4 +404,84 @@ func TestThrottle(t *testing.T) {
 	c.advanceTime(3 * time.Second)
 	_, err = c.AuthGET(AccessPublic, "/access-public-email")
 	c.expectOK(err)
+}
+
+func TestManagerPage(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	const firstManager = "manager-name"
+	const secondManager = "another-manager-name"
+
+	client := c.makeClient(clientPublicEmail, keyPublicEmail, true)
+	build1 := testBuild(1)
+	build1.Manager = firstManager
+	c.expectOK(client.UploadBuild(build1))
+
+	c.advanceTime(time.Hour)
+	build2 := testBuild(2)
+	build2.Manager = firstManager
+	buildErrorReq := &dashapi.BuildErrorReq{
+		Build: *build2,
+		Crash: dashapi.Crash{
+			Title:  "failed build 1",
+			Report: []byte("report\n"),
+			Log:    []byte("log\n"),
+		},
+	}
+	c.expectOK(client.ReportBuildError(buildErrorReq))
+	c.pollEmailBug()
+
+	c.advanceTime(time.Hour)
+	build3 := testBuild(3)
+	build3.Manager = firstManager
+	c.expectOK(client.UploadBuild(build3))
+
+	// And one more build from a different manager.
+	c.advanceTime(time.Hour)
+	build4 := testBuild(4)
+	build4.Manager = secondManager
+	c.expectOK(client.UploadBuild(build4))
+
+	// Query the first manager.
+	reply, err := c.AuthGET(AccessPublic, "/access-public-email/manager/"+firstManager)
+	c.expectOK(err)
+	assert.Contains(t, string(reply), "kernel_commit_title1")
+	assert.NotContains(t, string(reply), "kernel_commit_title2") // build error
+	assert.Contains(t, string(reply), "kernel_commit_title3")
+	assert.NotContains(t, string(reply), "kernel_commit_title4") // another manager
+
+	// Query the second manager.
+	reply, err = c.AuthGET(AccessPublic, "/access-public-email/manager/"+secondManager)
+	c.expectOK(err)
+	assert.NotContains(t, string(reply), "kernel_commit_title1")
+	assert.NotContains(t, string(reply), "kernel_commit_title2")
+	assert.NotContains(t, string(reply), "kernel_commit_title3")
+	assert.Contains(t, string(reply), "kernel_commit_title4") // another manager
+
+	// Query unknown manager.
+	_, err = c.AuthGET(AccessPublic, "/access-public-email/manager/abcd")
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
+	c.expectEQ(httpErr.Code, http.StatusBadRequest)
+}
+
+func TestReproSubmitAccess(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+	client := c.makeClient(clientPublic, keyPublic, true)
+
+	build := testBuild(1)
+	build.Manager = "test-manager"
+	client.UploadBuild(build)
+
+	reply, err := c.AuthGET(AccessPublic, "/access-public/manager/test-manager")
+	c.expectOK(err)
+	assert.NotContains(t, string(reply), "Send a reproducer")
+
+	for _, access := range []AccessLevel{AccessUser, AccessAdmin} {
+		reply, err := c.AuthGET(access, "/access-public/manager/test-manager")
+		c.expectOK(err)
+		assert.Contains(t, string(reply), "Send a reproducer")
+	}
 }

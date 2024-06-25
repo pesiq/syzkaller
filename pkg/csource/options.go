@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/sys/targets"
 )
@@ -48,9 +49,6 @@ type Options struct {
 	UseTmpDir  bool `json:"tmpdir,omitempty"`
 	HandleSegv bool `json:"segv,omitempty"`
 
-	// Generate code for use with repro package to prints log messages,
-	// which allows to detect hangs.
-	Repro bool `json:"repro,omitempty"`
 	Trace bool `json:"trace,omitempty"`
 	LegacyOptions
 }
@@ -169,7 +167,6 @@ func DefaultOpts(cfg *mgrconfig.Config) Options {
 		Sandbox:    cfg.Sandbox,
 		UseTmpDir:  true,
 		HandleSegv: true,
-		Repro:      true,
 	}
 	if cfg.TargetOS == targets.Linux {
 		opts.NetInjection = true
@@ -222,7 +219,7 @@ func deserializeLegacyOptions(data string, opts *Options) (int, error) {
 		"HandleSegv":    &opts.HandleSegv,
 		"WaitRepeat":    &ignoreBool,
 		"Debug":         &ignoreBool,
-		"Repro":         &opts.Repro,
+		"Repro":         &ignoreBool,
 	}
 
 	data = strings.TrimSpace(data)
@@ -366,6 +363,62 @@ var ExecutorOpts = Options{
 	Procs:     2,
 	Slowdown:  1,
 	Sandbox:   "none",
-	Repro:     true,
 	UseTmpDir: true,
+}
+
+func FeaturesToFlags(features flatrpc.Feature, manual Features) flatrpc.ExecEnv {
+	for feat := range flatrpc.EnumNamesFeature {
+		opt := FlatRPCFeaturesToCSource[feat]
+		if opt != "" && manual != nil && !manual[opt].Enabled {
+			features &= ^feat
+		}
+	}
+	var flags flatrpc.ExecEnv
+	if manual == nil || manual["net_reset"].Enabled {
+		flags |= flatrpc.ExecEnvEnableNetReset
+	}
+	if manual == nil || manual["cgroups"].Enabled {
+		flags |= flatrpc.ExecEnvEnableCgroups
+	}
+	if manual == nil || manual["close_fds"].Enabled {
+		flags |= flatrpc.ExecEnvEnableCloseFds
+	}
+	if features&flatrpc.FeatureExtraCoverage != 0 {
+		flags |= flatrpc.ExecEnvExtraCover
+	}
+	if features&flatrpc.FeatureDelayKcovMmap != 0 {
+		flags |= flatrpc.ExecEnvDelayKcovMmap
+	}
+	if features&flatrpc.FeatureNetInjection != 0 {
+		flags |= flatrpc.ExecEnvEnableTun
+	}
+	if features&flatrpc.FeatureNetDevices != 0 {
+		flags |= flatrpc.ExecEnvEnableNetDev
+	}
+	if features&flatrpc.FeatureDevlinkPCI != 0 {
+		flags |= flatrpc.ExecEnvEnableDevlinkPCI
+	}
+	if features&flatrpc.FeatureNicVF != 0 {
+		flags |= flatrpc.ExecEnvEnableNicVF
+	}
+	if features&flatrpc.FeatureVhciInjection != 0 {
+		flags |= flatrpc.ExecEnvEnableVhciInjection
+	}
+	if features&flatrpc.FeatureWifiEmulation != 0 {
+		flags |= flatrpc.ExecEnvEnableWifi
+	}
+	return flags
+}
+
+var FlatRPCFeaturesToCSource = map[flatrpc.Feature]string{
+	flatrpc.FeatureNetInjection:    "tun",
+	flatrpc.FeatureNetDevices:      "net_dev",
+	flatrpc.FeatureDevlinkPCI:      "devlink_pci",
+	flatrpc.FeatureNicVF:           "nic_vf",
+	flatrpc.FeatureVhciInjection:   "vhci",
+	flatrpc.FeatureWifiEmulation:   "wifi",
+	flatrpc.FeatureUSBEmulation:    "usb",
+	flatrpc.FeatureBinFmtMisc:      "binfmt_misc",
+	flatrpc.FeatureLRWPANEmulation: "ieee802154",
+	flatrpc.FeatureSwap:            "swap",
 }

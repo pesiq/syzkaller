@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -26,7 +27,6 @@ import (
 	"github.com/google/syzkaller/pkg/html"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vcs"
-	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 	"google.golang.org/appengine/v2"
@@ -57,17 +57,20 @@ func initHTTPHandlers() {
 	http.Handle("/x/minfo.txt", handlerWrapper(handleTextX(textMachineInfo)))
 	for ns := range getConfig(context.Background()).Namespaces {
 		http.Handle("/"+ns, handlerWrapper(handleMain))
-		http.Handle("/"+ns+"/fixed", handlerWrapper(handleFixed))
+		http.Handle("/"+ns+"/fixed", handlerWrapper(handleFixed)) // nolint: goconst // remove it with goconst 1.7.0+
 		http.Handle("/"+ns+"/invalid", handlerWrapper(handleInvalid))
 		http.Handle("/"+ns+"/graph/bugs", handlerWrapper(handleKernelHealthGraph))
 		http.Handle("/"+ns+"/graph/lifetimes", handlerWrapper(handleGraphLifetimes))
 		http.Handle("/"+ns+"/graph/fuzzing", handlerWrapper(handleGraphFuzzing))
 		http.Handle("/"+ns+"/graph/crashes", handlerWrapper(handleGraphCrashes))
+		http.Handle("/"+ns+"/graph/found-bugs", handlerWrapper(handleFoundBugsGraph))
+		http.Handle("/"+ns+"/graph/coverage", handlerWrapper(handleCoverageGraph))
 		http.Handle("/"+ns+"/repos", handlerWrapper(handleRepos))
 		http.Handle("/"+ns+"/bug-summaries", handlerWrapper(handleBugSummaries))
 		http.Handle("/"+ns+"/subsystems", handlerWrapper(handleSubsystemsList))
 		http.Handle("/"+ns+"/backports", handlerWrapper(handleBackports))
 		http.Handle("/"+ns+"/s/", handlerWrapper(handleSubsystemPage))
+		http.Handle("/"+ns+"/manager/", handlerWrapper(handleManagerPage))
 	}
 	http.HandleFunc("/cron/cache_update", cacheUpdate)
 	http.HandleFunc("/cron/minute_cache_update", handleMinuteCacheUpdate)
@@ -202,13 +205,25 @@ type uiAdminPage struct {
 	CauseBisectionsLink string
 	JobOverviewLink     string
 	MemcacheStats       *memcache.Statistics
+	Stopped             bool
+	StopLink            string
+	MoreStopClicks      int
+}
+
+type uiManagerPage struct {
+	Header        *uiHeader
+	Manager       *uiManager
+	Message       string
+	ShowReproForm bool
+	Builds        []*uiBuild
 }
 
 type uiManager struct {
 	Now                   time.Time
 	Namespace             string
 	Name                  string
-	Link                  string
+	Link                  string // link to the syz-manager
+	PageLink              string // link to the manager page
 	CoverLink             string
 	CurrentBuild          *uiBuild
 	FailedBuildBugLink    string
@@ -236,6 +251,7 @@ type uiBuild struct {
 	KernelCommitTitle   string
 	KernelCommitDate    time.Time
 	KernelConfigLink    string
+	Assets              []*uiAsset
 }
 
 type uiBugDiscussion struct {
@@ -373,6 +389,7 @@ type uiCrash struct {
 	ReproSyzLink    string
 	ReproCLink      string
 	ReproIsRevoked  bool
+	ReproLogLink    string
 	MachineInfoLink string
 	Assets          []*uiAsset
 	*uiBuild
@@ -521,7 +538,7 @@ func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error
 		BugFilter:      makeUIBugFilter(c, filter),
 	}
 
-	if isJSONRequested(r) {
+	if r.FormValue("json") == "1" {
 		w.Header().Set("Content-Type", "application/json")
 		return writeJSONVersionOf(w, data)
 	}
@@ -532,7 +549,7 @@ func handleMain(c context.Context, w http.ResponseWriter, r *http.Request) error
 func handleFixed(c context.Context, w http.ResponseWriter, r *http.Request) error {
 	return handleTerminalBugList(c, w, r, &TerminalBug{
 		Status:      BugStatusFixed,
-		Subpage:     "/fixed",
+		Subpage:     "/fixed", // nolint: goconst // TODO: remove it once goconst 1.7.0+ landed
 		ShowPatch:   true,
 		ShowPatched: true,
 	})
@@ -545,6 +562,54 @@ func handleInvalid(c context.Context, w http.ResponseWriter, r *http.Request) er
 		ShowPatch: false,
 		ShowStats: true,
 	})
+}
+
+func handleManagerPage(c context.Context, w http.ResponseWriter, r *http.Request) error {
+	hdr, err := commonHeader(c, r, w, "")
+	if err != nil {
+		return err
+	}
+	managers, err := CachedUIManagers(c, accessLevel(c, r), hdr.Namespace, nil)
+	if err != nil {
+		return err
+	}
+	var manager *uiManager
+	if pos := strings.Index(r.URL.Path, "/manager/"); pos != -1 {
+		manager = findManager(managers, r.URL.Path[pos+len("/manager/"):])
+	}
+	if manager == nil {
+		return fmt.Errorf("%w: manager is unknown", ErrClientBadRequest)
+	}
+	builds, err := loadBuilds(c, hdr.Namespace, manager.Name, BuildNormal)
+	if err != nil {
+		return fmt.Errorf("failed to query builds: %w", err)
+	}
+	managerPage := &uiManagerPage{Manager: manager, Header: hdr}
+	accessLevel := accessLevel(c, r)
+	if accessLevel >= AccessUser {
+		managerPage.ShowReproForm = true
+		if repro := r.FormValue("send-repro"); repro != "" {
+			err := saveReproTask(c, hdr.Namespace, manager.Name, []byte(repro))
+			if err != nil {
+				return fmt.Errorf("failed to request reproduction: %w", err)
+			}
+			managerPage.Message = "Repro request was saved!"
+		}
+	}
+
+	for _, build := range builds {
+		managerPage.Builds = append(managerPage.Builds, makeUIBuild(c, build, false))
+	}
+	return serveTemplate(w, "manager.html", managerPage)
+}
+
+func findManager(managers []*uiManager, name string) *uiManager {
+	for _, mgr := range managers {
+		if mgr.Name == name {
+			return mgr
+		}
+	}
+	return nil
 }
 
 func handleSubsystemPage(c context.Context, w http.ResponseWriter, r *http.Request) error {
@@ -700,39 +765,13 @@ type rawBackport struct {
 }
 
 func loadAllBackports(c context.Context) ([]*rawBackport, error) {
-	bugs, _, err := loadAllBugs(c, func(query *db.Query) *db.Query {
-		return query.Filter("FixCandidateJob>", "").Filter("Status=", BugStatusOpen)
-	})
+	bugs, jobs, _, err := relevantBackportJobs(c)
 	if err != nil {
 		return nil, err
 	}
-
-	var jobKeys []*db.Key
-	var jobBugs []*Bug
-	for _, bug := range bugs {
-		jobKey, err := db.DecodeKey(bug.FixCandidateJob)
-		if err != nil {
-			return nil, err
-		}
-		jobKeys = append(jobKeys, jobKey)
-		jobBugs = append(jobBugs, bug)
-	}
-
-	jobs := make([]*Job, len(jobKeys))
-	if err := db.GetMulti(c, jobKeys, jobs); err != nil {
-		return nil, err
-	}
-
 	var ret []*rawBackport
 	perCommit := map[string]*rawBackport{}
 	for i, job := range jobs {
-		// Some assertions just in case.
-		if !job.IsCrossTree() {
-			return nil, fmt.Errorf("job %s: expected to be cross-tree", jobKeys[i])
-		}
-		if len(job.Commits) != 1 || job.InvalidatedBy != "" {
-			continue
-		}
 		jobCommit := job.Commits[0]
 		to := &uiRepo{URL: job.MergeBaseRepo, Branch: job.MergeBaseBranch}
 		from := &uiRepo{URL: job.KernelRepo, Branch: job.KernelBranch}
@@ -755,7 +794,7 @@ func loadAllBackports(c context.Context) ([]*rawBackport, error) {
 			ret = append(ret, backport)
 			perCommit[hash] = backport
 		}
-		backport.Bugs = append(backport.Bugs, jobBugs[i])
+		backport.Bugs = append(backport.Bugs, bugs[i])
 	}
 	return ret, nil
 }
@@ -838,7 +877,7 @@ func handleTerminalBugList(c context.Context, w http.ResponseWriter, r *http.Req
 		BugFilter: makeUIBugFilter(c, typ.Filter),
 	}
 
-	if isJSONRequested(r) {
+	if r.FormValue("json") == "1" {
 		w.Header().Set("Content-Type", "application/json")
 		return writeJSONVersionOf(w, data)
 	}
@@ -859,6 +898,10 @@ func handleAdmin(c context.Context, w http.ResponseWriter, r *http.Request) erro
 		}
 	case "invalidate_bisection":
 		return handleInvalidateBisection(c, w, r)
+	case "emergency_stop":
+		if err := recordEmergencyStop(c); err != nil {
+			return fmt.Errorf("failed to record an emergency stop: %w", err)
+		}
 	default:
 		return fmt.Errorf("%w: unknown action %q", ErrClientBadRequest, action)
 	}
@@ -918,15 +961,28 @@ func handleAdmin(c context.Context, w http.ResponseWriter, r *http.Request) erro
 			return err
 		})
 	}
+	alreadyStopped := false
+	g.Go(func() error {
+		var err error
+		alreadyStopped, err = emergentlyStopped(c)
+		return err
+	})
 	err = g.Wait()
 	if err != nil {
 		return err
 	}
 	data := &uiAdminPage{
-		Header:        hdr,
-		Log:           errorLog,
-		Managers:      makeManagerList(managers, hdr.Namespace),
-		MemcacheStats: memcacheStats,
+		Header:         hdr,
+		Log:            errorLog,
+		Managers:       makeManagerList(managers, hdr.Namespace),
+		MemcacheStats:  memcacheStats,
+		Stopped:        alreadyStopped,
+		MoreStopClicks: 2,
+		StopLink:       html.AmendURL("/admin", "stop_clicked", "1"),
+	}
+	if r.FormValue("stop_clicked") != "" {
+		data.MoreStopClicks = 1
+		data.StopLink = html.AmendURL("/admin", "action", "emergency_stop")
 	}
 	if r.FormValue("job_type") != "" {
 		data.TypeJobs = &uiJobList{Title: "Last jobs:", Jobs: typeJobs}
@@ -1132,7 +1188,7 @@ func handleBug(c context.Context, w http.ResponseWriter, r *http.Request) error 
 				"Cause bisection attempts", uiList))
 		}
 	}
-	if isJSONRequested(r) {
+	if r.FormValue("json") == "1" {
 		w.Header().Set("Content-Type", "application/json")
 		return writeJSONVersionOf(w, data)
 	}
@@ -1299,10 +1355,6 @@ func handleBugSummaries(c context.Context, w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(list)
-}
-
-func isJSONRequested(request *http.Request) bool {
-	return request.FormValue("json") == "1"
 }
 
 func writeJSONVersionOf(writer http.ResponseWriter, page interface{}) error {
@@ -1955,14 +2007,18 @@ func linkifyReport(report []byte, repo, commit string) template.HTML {
 
 var sourceFileRe = regexp.MustCompile("( |\t|\n)([a-zA-Z0-9/_.-]+\\.(?:h|c|cc|cpp|s|S|go|rs)):([0-9]+)( |!|\\)|\t|\n)")
 
-func makeUICrash(c context.Context, crash *Crash, build *Build) *uiCrash {
-	uiAssets := []*uiAsset{}
-	for _, asset := range createAssetList(build, crash) {
+func makeUIAssets(build *Build, crash *Crash, forReport bool) []*uiAsset {
+	var uiAssets []*uiAsset
+	for _, asset := range createAssetList(build, crash, forReport) {
 		uiAssets = append(uiAssets, &uiAsset{
 			Title:       asset.Title,
 			DownloadURL: asset.DownloadURL,
 		})
 	}
+	return uiAssets
+}
+
+func makeUICrash(c context.Context, crash *Crash, build *Build) *uiCrash {
 	ui := &uiCrash{
 		Title:           crash.Title,
 		Manager:         crash.Manager,
@@ -1973,17 +2029,18 @@ func makeUICrash(c context.Context, crash *Crash, build *Build) *uiCrash {
 		ReportLink:      textLink(textCrashReport, crash.Report),
 		ReproSyzLink:    textLink(textReproSyz, crash.ReproSyz),
 		ReproCLink:      textLink(textReproC, crash.ReproC),
+		ReproLogLink:    textLink(textReproLog, crash.ReproLog),
 		ReproIsRevoked:  crash.ReproIsRevoked,
 		MachineInfoLink: textLink(textMachineInfo, crash.MachineInfo),
-		Assets:          uiAssets,
+		Assets:          makeUIAssets(build, crash, true),
 	}
 	if build != nil {
-		ui.uiBuild = makeUIBuild(c, build)
+		ui.uiBuild = makeUIBuild(c, build, true)
 	}
 	return ui
 }
 
-func makeUIBuild(c context.Context, build *Build) *uiBuild {
+func makeUIBuild(c context.Context, build *Build, forReport bool) *uiBuild {
 	return &uiBuild{
 		Time:                build.Time,
 		SyzkallerCommit:     build.SyzkallerCommit,
@@ -1997,6 +2054,7 @@ func makeUIBuild(c context.Context, build *Build) *uiBuild {
 		KernelCommitTitle:   build.KernelCommitTitle,
 		KernelCommitDate:    build.KernelCommitDate,
 		KernelConfigLink:    textLink(textKernelConfig, build.KernelConfig),
+		Assets:              makeUIAssets(build, nil, forReport),
 	}
 }
 
@@ -2083,7 +2141,7 @@ func loadManagers(c context.Context, accessLevel AccessLevel, ns string, filter 
 	}
 	uiBuilds := make(map[string]*uiBuild)
 	for _, build := range builds {
-		uiBuilds[build.Namespace+"|"+build.ID] = makeUIBuild(c, build)
+		uiBuilds[build.Namespace+"|"+build.ID] = makeUIBuild(c, build, true)
 	}
 	var fullStats []*ManagerStats
 	for _, mgr := range managers {
@@ -2118,6 +2176,7 @@ func loadManagers(c context.Context, accessLevel AccessLevel, ns string, filter 
 			Namespace:             mgr.Namespace,
 			Name:                  mgr.Name,
 			Link:                  link,
+			PageLink:              mgr.Namespace + "/manager/" + mgr.Name,
 			CoverLink:             coverURL,
 			CurrentBuild:          uiBuilds[mgr.Namespace+"|"+mgr.CurrentBuild],
 			FailedBuildBugLink:    bugLink(mgr.FailedBuildBug),

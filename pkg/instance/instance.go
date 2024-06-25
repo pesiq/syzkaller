@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -92,7 +91,7 @@ func (env *env) BuildSyzkaller(repoURL, commit string) (string, error) {
 		return "", fmt.Errorf("failed to checkout syzkaller repo: %w", err)
 	}
 	// The following commit ("syz-fuzzer: support optional flags") adds support for optional flags
-	// in syz-fuzzer and syz-execprog. This is required to invoke older binaries with newer flags
+	// in syz-execprog. This is required to invoke older binaries with newer flags
 	// without failing due to unknown flags.
 	optionalFlags, err := repo.Contains("64435345f0891706a7e0c7885f5f7487581e6005")
 	if err != nil {
@@ -349,70 +348,38 @@ func (inst *inst) test() EnvTestResult {
 	return ret
 }
 
-// testInstance tests basic operation of the provided VM
-// (that we can copy binaries, run binaries, they can connect to host, run syzkaller programs, etc).
+// testInstance tests that the VM does not crash on a simple program.
 // TestError is returned if there is a problem with the kernel (e.g. crash).
 func (inst *inst) testInstance() error {
-	ln, err := net.Listen("tcp", ":")
+	execProg, err := SetupExecProg(inst.vm, inst.cfg, inst.reporter, &OptionalConfig{
+		OldFlagsCompatMode: !inst.optionalFlags,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to open listening socket: %w", err)
-	}
-	defer ln.Close()
-	acceptErr := make(chan error, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err == nil {
-			conn.Close()
-		}
-		acceptErr <- err
-	}()
-	fwdAddr, err := inst.vm.Forward(ln.Addr().(*net.TCPAddr).Port)
-	if err != nil {
-		return fmt.Errorf("failed to setup port forwarding: %w", err)
-	}
-
-	fuzzerBin, err := inst.vm.Copy(inst.cfg.FuzzerBin)
-	if err != nil {
-		return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
-	}
-
-	// If ExecutorBin is provided, it means that syz-executor is already in the image,
-	// so no need to copy it.
-	executorBin := inst.cfg.SysTarget.ExecutorBin
-	if executorBin == "" {
-		executorBin, err = inst.vm.Copy(inst.cfg.ExecutorBin)
-		if err != nil {
-			return &TestError{Title: fmt.Sprintf("failed to copy test binary to VM: %v", err)}
-		}
-	}
-
-	cmd := OldFuzzerCmd(fuzzerBin, executorBin, targets.TestOS, inst.cfg.TargetOS, inst.cfg.TargetArch, fwdAddr,
-		inst.cfg.Sandbox, inst.cfg.SandboxArg, 0, inst.cfg.Cover, true, inst.optionalFlags, inst.cfg.Timeouts.Slowdown)
-	outc, errc, err := inst.vm.Run(10*time.Minute*inst.cfg.Timeouts.Scale, nil, cmd)
-	if err != nil {
-		return fmt.Errorf("failed to run binary in VM: %w", err)
-	}
-	rep := inst.vm.MonitorExecution(outc, errc, inst.reporter, vm.ExitNormal)
-	if rep != nil {
-		if err := inst.reporter.Symbolize(rep); err != nil {
-			// TODO(dvyukov): send such errors to dashboard.
-			log.Logf(0, "failed to symbolize report: %v", err)
-		}
-		return &TestError{
-			Title:  rep.Title,
-			Report: rep,
-		}
-	}
-	select {
-	case err := <-acceptErr:
 		return err
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("test machine failed to connect to host")
 	}
+	// Note: we create the test program on a newer syzkaller revision and pass it to the old execprog.
+	// We rely on the non-strict program parsing to parse it successfully.
+	testProg := inst.cfg.Target.DataMmapProg().Serialize()
+	// Use the same options as the target reproducer.
+	// E.g. if it does not use wifi, we won't test it, which reduces changes of unrelated kernel bugs.
+	// Note: we keep fault injection if it's enabled in the reproducer to test that fault injection works
+	// (does not produce some kernel oops when activated).
+	opts, err := inst.csourceOptions()
+	if err != nil {
+		return err
+	}
+	opts.Repeat = false
+	out, err := execProg.RunSyzProg(testProg, inst.cfg.Timeouts.NoOutputRunningTime, opts, vm.ExitNormal)
+	if err != nil {
+		return &TestError{Title: err.Error()}
+	}
+	if out.Report != nil {
+		return &TestError{Title: out.Report.Title, Report: out.Report}
+	}
+	return nil
 }
 
 func (inst *inst) testRepro() ([]byte, error) {
-	var err error
 	execProg, err := SetupExecProg(inst.vm, inst.cfg, inst.reporter, &OptionalConfig{
 		OldFlagsCompatMode: !inst.optionalFlags,
 	})
@@ -424,29 +391,23 @@ func (inst *inst) testRepro() ([]byte, error) {
 			return nil, err
 		}
 		if res != nil && res.Report != nil {
-			return res.RawOutput, &CrashError{Report: res.Report}
+			return res.Output, &CrashError{Report: res.Report}
 		}
-		return res.RawOutput, nil
+		return res.Output, nil
 	}
 	out := []byte{}
 	if len(inst.reproSyz) > 0 {
-		var opts csource.Options
-		opts, err = csource.DeserializeOptions(inst.reproOpts)
+		opts, err := inst.csourceOptions()
 		if err != nil {
 			return nil, err
 		}
-		// Combine repro options and default options in a way that increases chances to reproduce the crash.
-		// First, we always enable threaded/collide as it should be [almost] strictly better.
-		// Executor does not support empty sandbox, so we use none instead.
-		// Finally, always use repeat and multiple procs.
-		if opts.Sandbox == "" {
-			opts.Sandbox = "none"
-		}
-		opts.Repeat, opts.Threaded = true, true
 		out, err = transformError(execProg.RunSyzProg(inst.reproSyz,
-			inst.cfg.Timeouts.NoOutputRunningTime, opts))
+			inst.cfg.Timeouts.NoOutputRunningTime, opts, SyzExitConditions))
+		if err != nil {
+			return out, err
+		}
 	}
-	if err == nil && len(inst.reproC) > 0 {
+	if len(inst.reproC) > 0 {
 		// We should test for more than full "no output" timeout, but the problem is that C reproducers
 		// don't print anything, so we will get a false "no output" crash.
 		out, err = transformError(execProg.RunCProgRaw(inst.reproC, inst.cfg.Target,
@@ -455,70 +416,26 @@ func (inst *inst) testRepro() ([]byte, error) {
 	return out, err
 }
 
-type OptionalFuzzerArgs struct {
-	Slowdown   int
-	RawCover   bool
-	SandboxArg int
-}
-
-type FuzzerCmdArgs struct {
-	Fuzzer    string
-	Executor  string
-	Name      string
-	OS        string
-	Arch      string
-	FwdAddr   string
-	Sandbox   string
-	Procs     int
-	Verbosity int
-	Cover     bool
-	Debug     bool
-	Test      bool
-	Runtest   bool
-	Optional  *OptionalFuzzerArgs
-}
-
-func FuzzerCmd(args *FuzzerCmdArgs) string {
-	osArg := ""
-	if targets.Get(args.OS, args.Arch).HostFuzzer {
-		// Only these OSes need the flag, because the rest assume host OS.
-		// But speciying OS for all OSes breaks patch testing on syzbot
-		// because old execprog does not have os flag.
-		osArg = " -os=" + args.OS
+func (inst *inst) csourceOptions() (csource.Options, error) {
+	if len(inst.reproSyz) == 0 {
+		// If no syz repro is provided, the functionality is likely being used to test
+		// for the crashes that don't need a reproducer (e.g. kernel build/boot/test errors).
+		// Use the default options, that's the best we can do.
+		return csource.DefaultOpts(inst.cfg), nil
 	}
-	runtestArg := ""
-	if args.Runtest {
-		runtestArg = " -runtest"
+	opts, err := csource.DeserializeOptions(inst.reproOpts)
+	if err != nil {
+		return opts, err
 	}
-	verbosityArg := ""
-	if args.Verbosity != 0 {
-		verbosityArg = fmt.Sprintf(" -vv=%v", args.Verbosity)
+	// Combine repro options and default options in a way that increases chances to reproduce the crash.
+	// First, we always enable threaded/collide as it should be [almost] strictly better.
+	// Executor does not support empty sandbox, so we use none instead.
+	// Finally, always use repeat and multiple procs.
+	if opts.Sandbox == "" {
+		opts.Sandbox = "none"
 	}
-	optionalArg := ""
-	if args.Optional != nil {
-		flags := []tool.Flag{
-			{Name: "slowdown", Value: fmt.Sprint(args.Optional.Slowdown)},
-			{Name: "raw_cover", Value: fmt.Sprint(args.Optional.RawCover)},
-			{Name: "sandbox_arg", Value: fmt.Sprint(args.Optional.SandboxArg)},
-		}
-		optionalArg = " " + tool.OptionalFlags(flags)
-	}
-	return fmt.Sprintf("%v -executor=%v -name=%v -arch=%v%v -manager=%v -sandbox=%v"+
-		" -procs=%v -cover=%v -debug=%v -test=%v%v%v%v",
-		args.Fuzzer, args.Executor, args.Name, args.Arch, osArg, args.FwdAddr, args.Sandbox,
-		args.Procs, args.Cover, args.Debug, args.Test, runtestArg, verbosityArg, optionalArg)
-}
-
-func OldFuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, sandboxArg, procs int,
-	cover, test, optionalFlags bool, slowdown int) string {
-	var optional *OptionalFuzzerArgs
-	if optionalFlags {
-		optional = &OptionalFuzzerArgs{Slowdown: slowdown, SandboxArg: sandboxArg}
-	}
-	return FuzzerCmd(&FuzzerCmdArgs{Fuzzer: fuzzer, Executor: executor, Name: name,
-		OS: OS, Arch: arch, FwdAddr: fwdAddr, Sandbox: sandbox,
-		Procs: procs, Verbosity: 0, Cover: cover, Debug: false, Test: test, Runtest: false,
-		Optional: optional})
+	opts.Repeat, opts.Threaded = true, true
+	return opts, nil
 }
 
 func ExecprogCmd(execprog, executor, OS, arch, sandbox string, sandboxArg int, repeat, threaded, collide bool,

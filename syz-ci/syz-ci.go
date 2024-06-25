@@ -60,7 +60,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -79,14 +78,18 @@ var (
 	flagAutoUpdate = flag.Bool("autoupdate", true, "auto-update the binary (for testing)")
 	flagManagers   = flag.Bool("managers", true, "start managers (for testing)")
 	flagDebug      = flag.Bool("debug", false, "debug mode (for testing)")
+	// nolint: lll
+	flagExitOnUpgrade = flag.Bool("exit-on-upgrade", false, "exit after a syz-ci upgrade is applied; otherwise syz-ci restarts")
 )
 
 type Config struct {
 	Name string `json:"name"`
 	HTTP string `json:"http"`
 	// If manager http address is not specified, give it an address starting from this port. Optional.
+	// This is also used to auto-assign ports for test instances.
 	ManagerPort int `json:"manager_port_start"`
 	// If manager rpc address is not specified, give it addresses starting from this port. By default 30000.
+	// This is also used to auto-assign ports for test instances.
 	RPCPort         int    `json:"rpc_port_start"`
 	DashboardAddr   string `json:"dashboard_addr"`   // Optional.
 	DashboardClient string `json:"dashboard_client"` // Optional.
@@ -104,6 +107,8 @@ type Config struct {
 	// Path to upload coverage reports from managers (optional).
 	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
 	CoverUploadPath string `json:"cover_upload_path"`
+	// Path to upload json coverage reports from managers (optional).
+	CoverPipelinePath string `json:"cover_pipeline_path"`
 	// Path to upload corpus.db from managers (optional).
 	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
 	CorpusUploadPath string `json:"corpus_upload_path"`
@@ -131,6 +136,9 @@ type Config struct {
 	CommitPollPeriod int `json:"commit_poll_period"`
 	// Asset Storage config.
 	AssetStorage *asset.Config `json:"asset_storage"`
+	// Per-vm type JSON diffs that will be applied to every instace of the
+	// corresponding VM type.
+	PatchVMConfigs map[string]json.RawMessage `json:"patch_vm_configs"`
 }
 
 type ManagerConfig struct {
@@ -195,9 +203,17 @@ type ManagerConfig struct {
 	Jobs         ManagerJobs `json:"jobs"`
 	// Extra commits to cherry pick to older kernel revisions.
 	BisectBackports []vcs.BackportCommit `json:"bisect_backports"`
-
+	// Base syz-manager config for the instance.
 	ManagerConfig json.RawMessage `json:"manager_config"`
-	managercfg    *mgrconfig.Config
+	// If the kernel's commit is older than MaxKernelLagDays days,
+	// fuzzing won't be started on this instance.
+	// By default it's 30 days.
+	MaxKernelLagDays int `json:"max_kernel_lag_days"`
+	managercfg       *mgrconfig.Config
+
+	// Auto-assigned ports used by test instances.
+	testHTTPPort int
+	testRPCPort  int
 }
 
 type ManagerJobs struct {
@@ -414,25 +430,11 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	} else {
 		managercfg.Name = cfg.Name + "-" + mgr.Name
 	}
-	// Manager name must not contain dots because it is used as GCE image name prefix.
-	managerNameRe := regexp.MustCompile("^[a-zA-Z0-9-_]{3,64}$")
-	if !managerNameRe.MatchString(mgr.Name) {
-		return fmt.Errorf("param 'managers.name' has bad value: %q", mgr.Name)
-	}
 	if mgr.CompilerType == "" {
 		mgr.CompilerType = "gcc"
 	}
 	if mgr.Branch == "" {
 		mgr.Branch = "master"
-	}
-	if mgr.Jobs.AnyEnabled() && (cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
-		return fmt.Errorf("manager %v: has jobs but no dashboard info", mgr.Name)
-	}
-	if mgr.Jobs.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {
-		return fmt.Errorf("manager %v: commit_poll is set but no dashboard info", mgr.Name)
-	}
-	if (mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) && cfg.BisectBinDir == "" {
-		return fmt.Errorf("manager %v: enabled bisection but no bisect_bin_dir", mgr.Name)
 	}
 	mgr.managercfg = managercfg
 	managercfg.Syzkaller = filepath.FromSlash("syzkaller/current")
@@ -444,6 +446,10 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 		managercfg.RPC = fmt.Sprintf(":%v", cfg.RPCPort)
 		cfg.RPCPort++
 	}
+	mgr.testHTTPPort = cfg.ManagerPort
+	cfg.ManagerPort++
+	mgr.testRPCPort = cfg.RPCPort
+	cfg.RPCPort++
 	// Note: we don't change Compiler/Ccache because it may be just "gcc" referring
 	// to the system binary, or pkg/build/netbsd.go uses "g++" and "clang++" as special marks.
 	mgr.Userspace = osutil.Abs(mgr.Userspace)
@@ -451,9 +457,21 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	mgr.KernelBaselineConfig = osutil.Abs(mgr.KernelBaselineConfig)
 	mgr.KernelCmdline = osutil.Abs(mgr.KernelCmdline)
 	mgr.KernelSysctl = osutil.Abs(mgr.KernelSysctl)
-
 	if mgr.KernelConfig != "" && mgr.KernelBaselineConfig == "" {
 		mgr.KernelBaselineConfig = inferBaselineConfig(mgr.KernelConfig)
+	}
+	if mgr.MaxKernelLagDays == 0 {
+		mgr.MaxKernelLagDays = 30
+	}
+	if err := mgr.validate(cfg); err != nil {
+		return err
+	}
+
+	if cfg.PatchVMConfigs[managercfg.Type] != nil {
+		managercfg.VM, err = config.MergeJSONs(managercfg.VM, cfg.PatchVMConfigs[managercfg.Type])
+		if err != nil {
+			return fmt.Errorf("failed to patch manager %v's VM: %w", mgr.Name, err)
+		}
 	}
 	return nil
 }

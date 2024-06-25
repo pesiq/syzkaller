@@ -9,11 +9,25 @@ import (
 	"reflect"
 )
 
+type MinimizeParams struct {
+	// CallIndex was intentionally not included in this struct, since its
+	// default value should be -1, while the default value of 0 would introduce a bug.
+
+	// If RemoveCallsOnly is set to true, Minimize() focuses only on removing whole calls.
+	RemoveCallsOnly bool
+
+	// Light speeds up the minimization by
+	// 1. Not removing array elements one by one.
+	// 2. Not bisecting blobs too much.
+	// 3. Not minimizing integer values.
+	Light bool
+}
+
 // Minimize minimizes program p into an equivalent program using the equivalence
 // predicate pred. It iteratively generates simpler programs and asks pred
 // whether it is equal to the original program or not. If it is equivalent then
 // the simplification attempt is committed and the process continues.
-func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool) (*Prog, int) {
+func Minimize(p0 *Prog, callIndex0 int, params MinimizeParams, pred0 func(*Prog, int) bool) (*Prog, int) {
 	pred := func(p *Prog, callIndex int) bool {
 		p.sanitizeFix()
 		p.debugValidate()
@@ -28,33 +42,35 @@ func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool)
 	}
 
 	// Try to remove all calls except the last one one-by-one.
-	p0, callIndex0 = removeCalls(p0, callIndex0, crash, pred)
+	p0, callIndex0 = removeCalls(p0, callIndex0, pred)
 
-	// Try to reset all call props to their default values.
-	p0 = resetCallProps(p0, callIndex0, pred)
+	if !params.RemoveCallsOnly {
+		// Try to reset all call props to their default values.
+		p0 = resetCallProps(p0, callIndex0, pred)
 
-	// Try to minimize individual calls.
-	for i := 0; i < len(p0.Calls); i++ {
-		if p0.Calls[i].Meta.Attrs.NoMinimize {
-			continue
-		}
-		ctx := &minimizeArgsCtx{
-			target:     p0.Target,
-			p0:         &p0,
-			callIndex0: callIndex0,
-			crash:      crash,
-			pred:       pred,
-			triedPaths: make(map[string]bool),
-		}
-	again:
-		ctx.p = p0.Clone()
-		ctx.call = ctx.p.Calls[i]
-		for j, field := range ctx.call.Meta.Args {
-			if ctx.do(ctx.call.Args[j], field.Name, "") {
-				goto again
+		// Try to minimize individual calls.
+		for i := 0; i < len(p0.Calls); i++ {
+			if p0.Calls[i].Meta.Attrs.NoMinimize {
+				continue
 			}
+			ctx := &minimizeArgsCtx{
+				target:     p0.Target,
+				p0:         &p0,
+				callIndex0: callIndex0,
+				params:     params,
+				pred:       pred,
+				triedPaths: make(map[string]bool),
+			}
+		again:
+			ctx.p = p0.Clone()
+			ctx.call = ctx.p.Calls[i]
+			for j, field := range ctx.call.Meta.Args {
+				if ctx.do(ctx.call.Args[j], field.Name, "") {
+					goto again
+				}
+			}
+			p0 = minimizeCallProps(p0, i, callIndex0, pred)
 		}
-		p0 = minimizeCallProps(p0, i, callIndex0, pred)
 	}
 
 	if callIndex0 != -1 {
@@ -66,7 +82,18 @@ func Minimize(p0 *Prog, callIndex0 int, crash bool, pred0 func(*Prog, int) bool)
 	return p0, callIndex0
 }
 
-func removeCalls(p0 *Prog, callIndex0 int, crash bool, pred func(*Prog, int) bool) (*Prog, int) {
+func removeCalls(p0 *Prog, callIndex0 int, pred func(*Prog, int) bool) (*Prog, int) {
+	if callIndex0 >= 0 && callIndex0+2 < len(p0.Calls) {
+		// It's frequently the case that all subsequent calls were not necessary.
+		// Try to drop them all at once.
+		p := p0.Clone()
+		for i := len(p0.Calls) - 1; i > callIndex0; i-- {
+			p.RemoveCall(i)
+		}
+		if pred(p, callIndex0) {
+			p0 = p
+		}
+	}
 	for i := len(p0.Calls) - 1; i >= 0; i-- {
 		if i == callIndex0 {
 			continue
@@ -142,7 +169,7 @@ type minimizeArgsCtx struct {
 	p          *Prog
 	call       *Call
 	callIndex0 int
-	crash      bool
+	params     MinimizeParams
 	pred       func(*Prog, int) bool
 	triedPaths map[string]bool
 }
@@ -214,7 +241,7 @@ func (typ *ArrayType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool 
 		elem := a.Inner[i]
 		elemPath := fmt.Sprintf("%v-%v", path, i)
 		// Try to remove individual elements one-by-one.
-		if !ctx.crash && !ctx.triedPaths[elemPath] &&
+		if !ctx.params.Light && !ctx.triedPaths[elemPath] &&
 			(typ.Kind == ArrayRandLen ||
 				typ.Kind == ArrayRangeLen && uint64(len(a.Inner)) > typ.RangeBegin) {
 			ctx.triedPaths[elemPath] = true
@@ -257,7 +284,7 @@ func (typ *ProcType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 func minimizeInt(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 	// TODO: try to reset bits in ints
 	// TODO: try to set separate flags
-	if ctx.crash {
+	if ctx.params.Light {
 		return false
 	}
 	a := arg.(*ConstArg)
@@ -267,17 +294,25 @@ func minimizeInt(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 	}
 	v0 := a.Val
 	a.Val = def.Val
+
+	// By mutating an integer, we risk violating conditional fields.
+	// If the fields are patched, the minimization process must be restarted.
+	patched := ctx.call.setDefaultConditions(ctx.p.Target, false)
 	if ctx.pred(ctx.p, ctx.callIndex0) {
 		*ctx.p0 = ctx.p
 		ctx.triedPaths[path] = true
 		return true
 	}
 	a.Val = v0
-	return false
+	if patched {
+		// No sense to return here.
+		ctx.triedPaths[path] = true
+	}
+	return patched
 }
 
 func (typ *ResourceType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
-	if ctx.crash {
+	if ctx.params.Light {
 		return false
 	}
 	a := arg.(*ResultArg)
@@ -321,7 +356,7 @@ func (typ *BufferType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool
 				ctx.target.assignSizesCall(ctx.call)
 			}
 			step /= 2
-			if ctx.crash {
+			if ctx.params.Light {
 				break
 			}
 		}

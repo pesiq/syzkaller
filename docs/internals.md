@@ -11,21 +11,26 @@ red labels indicate corresponding configuration options.
 
 ![Process structure for syzkaller](process_structure.png?raw=true)
 
-The `syz-manager` process starts, monitors and restarts several VM instances, and starts a `syz-fuzzer` process inside of the VMs.
-`syz-manager` is responsible for persistent corpus and crash storage.
-It runs on a host with stable kernel which does not experience white-noise fuzzer load.
+`syz-manager` is responsible for:
+* Starting/restarting/monitoring VM instances.
+* The actual fuzzing process (input generation, mutation, minimization, etc.).
+* Persistent corpus and crash storage.
 
-The `syz-fuzzer` process runs inside of presumably unstable VMs.
-The `syz-fuzzer` guides fuzzing process (input generation, mutation, minimization, etc.) and sends inputs that trigger new coverage back to the `syz-manager` process via RPC.
-It also starts transient `syz-executor` processes.
+It runs on a host with a stable kernel which does not experience white-noise fuzzer load.
 
-Each `syz-executor` process executes a single input (a sequence of syscalls).
-It accepts the program to execute from the `syz-fuzzer` process and sends results back.
-It is designed to be as simple as possible (to not interfere with fuzzing process), written in C++, compiled as static binary and uses shared memory for communication.
+`syz-manager` starts `syz-executor` processes (one inside each VM).
+`syz-executor`s comminucate with `syz-manager` over RPC to receive the programs
+that must be executed and to report back the results (error statuses, collected coverage, etc.).
+
+To execute programs, `syz-executor` starts transient subprocesses.
+
+Each transient subprocess executes a single input (a sequence of syscalls).
+It is designed to be as simple as possible (to not interfere with fuzzing process),
+written in C++, compiled as static binary and uses shared memory for communication.
 
 ## Syscall descriptions
 
-The `syz-fuzzer` process generates programs to be executed by `syz-executor` based on syscall descriptions described [here](syscall_descriptions.md).
+The `syz-manager` process generates programs based on syscall descriptions described [here](syscall_descriptions.md).
 
 ## Coverage
 

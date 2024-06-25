@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -17,7 +18,6 @@ import (
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/html"
 	"github.com/google/syzkaller/sys/targets"
-	"golang.org/x/net/context"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
 )
@@ -106,7 +106,7 @@ func needReport(c context.Context, typ string, state *ReportingState, bug *Bug) 
 		return
 	}
 	link = bugReporting.Link
-	if !bugReporting.Reported.IsZero() && bugReporting.ReproLevel >= bug.ReproLevel {
+	if !bugReporting.Reported.IsZero() && bugReporting.ReproLevel >= bug.HeadReproLevel {
 		status = fmt.Sprintf("%v: reported%v on %v",
 			reporting.DisplayTitle, reproStr(bugReporting.ReproLevel),
 			html.FormatTime(bugReporting.Reported))
@@ -120,7 +120,8 @@ func needReport(c context.Context, typ string, state *ReportingState, bug *Bug) 
 		reporting, bugReporting = nil, nil
 		return
 	}
-	if bug.ReproLevel < ReproLevelC && timeSince(c, bug.FirstTime) < cfg.WaitForRepro {
+	if crashNeedsRepro(bug.Title) && bug.ReproLevel < ReproLevelC &&
+		timeSince(c, bug.FirstTime) < cfg.WaitForRepro {
 		status = fmt.Sprintf("%v: waiting for C repro", reporting.DisplayTitle)
 		reporting, bugReporting = nil, nil
 		return
@@ -136,20 +137,18 @@ func needReport(c context.Context, typ string, state *ReportingState, bug *Bug) 
 		return
 	}
 
-	// Limit number of reports sent per day,
-	// but don't limit sending repros to already reported bugs.
-	if bugReporting.Reported.IsZero() && ent.Sent >= reporting.DailyLimit {
+	// Limit number of reports sent per day.
+	if ent.Sent >= reporting.DailyLimit {
 		status = fmt.Sprintf("%v: out of quota for today", reporting.DisplayTitle)
 		reporting, bugReporting = nil, nil
 		return
 	}
 
 	// Ready to be reported.
-	if bugReporting.Reported.IsZero() {
-		// This update won't be committed, but it is useful as a best effort measure
-		// so that we don't overflow the limit in a single poll.
-		ent.Sent++
-	}
+	// This update won't be committed, but it is useful as a best effort measure
+	// so that we don't overflow the limit in a single poll.
+	ent.Sent++
+
 	status = fmt.Sprintf("%v: ready to report", reporting.DisplayTitle)
 	if !bugReporting.Reported.IsZero() {
 		status += fmt.Sprintf(" (reported%v on %v)",
@@ -538,14 +537,6 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 	if len(report) > maxMailReportLen {
 		report = report[:maxMailReportLen]
 	}
-	reproC, _, err := getText(c, textReproC, crash.ReproC)
-	if err != nil {
-		return nil, err
-	}
-	reproSyz, err := loadReproSyz(c, crash)
-	if err != nil {
-		return nil, err
-	}
 	machineInfo, _, err := getText(c, textMachineInfo, crash.MachineInfo)
 	if err != nil {
 		return nil, err
@@ -558,7 +549,7 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 	if !bugReporting.Reported.IsZero() {
 		typ = dashapi.ReportRepro
 	}
-	assetList := createAssetList(build, crash)
+	assetList := createAssetList(build, crash, true)
 	kernelRepo := kernelRepoInfo(c, build)
 	rep := &dashapi.BugReport{
 		Type:            typ,
@@ -573,10 +564,6 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 		ReportLink:      externalLink(c, textCrashReport, crash.Report),
 		CC:              kernelRepo.CC.Always,
 		Maintainers:     append(crash.Maintainers, kernelRepo.CC.Maintainers...),
-		ReproC:          reproC,
-		ReproCLink:      externalLink(c, textReproC, crash.ReproC),
-		ReproSyz:        reproSyz,
-		ReproSyzLink:    externalLink(c, textReproSyz, crash.ReproSyz),
 		ReproOpts:       crash.ReproOpts,
 		MachineInfo:     machineInfo,
 		MachineInfoLink: externalLink(c, textMachineInfo, crash.MachineInfo),
@@ -587,6 +574,18 @@ func crashBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 		Manager:         crash.Manager,
 		Assets:          assetList,
 		ReportElements:  &dashapi.ReportElements{GuiltyFiles: crash.ReportElements.GuiltyFiles},
+	}
+	if !crash.ReproIsRevoked {
+		rep.ReproCLink = externalLink(c, textReproC, crash.ReproC)
+		rep.ReproC, _, err = getText(c, textReproC, crash.ReproC)
+		if err != nil {
+			return nil, err
+		}
+		rep.ReproSyzLink = externalLink(c, textReproSyz, crash.ReproSyz)
+		rep.ReproSyz, err = loadReproSyz(c, crash)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if bugReporting.CC != "" {
 		rep.CC = append(rep.CC, strings.Split(bugReporting.CC, "|")...)
@@ -1067,9 +1066,9 @@ func incomingCommandCmd(c context.Context, now time.Time, cmd *dashapi.BugUpdate
 	case dashapi.BugStatusOpen:
 		bug.Status = BugStatusOpen
 		bug.Closed = time.Time{}
+		stateEnt.Sent++
 		if bugReporting.Reported.IsZero() {
 			bugReporting.Reported = now
-			stateEnt.Sent++ // sending repro does not count against the quota
 		}
 		if bugReporting.OnHold.IsZero() && cmd.OnHold {
 			bugReporting.OnHold = now

@@ -133,7 +133,7 @@ type builder interface {
 
 func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
 	if targetOS == targets.Linux {
-		if vmType == "gvisor" {
+		if vmType == targets.GVisor {
 			return gvisor{}, nil
 		} else if vmType == "cuttlefish" {
 			return cuttlefish{}, nil
@@ -144,7 +144,6 @@ func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
 	builders := map[string]builder{
 		targets.Linux:   linux{},
 		targets.Fuchsia: fuchsia{},
-		targets.Akaros:  akaros{},
 		targets.OpenBSD: openbsd{},
 		targets.NetBSD:  netbsd{},
 		targets.FreeBSD: freebsd{},

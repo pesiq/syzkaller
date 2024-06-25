@@ -7,7 +7,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 
 	"github.com/golangci/golangci-lint/pkg/config"
-	"github.com/golangci/golangci-lint/pkg/golinters/goanalysis"
+	"github.com/golangci/golangci-lint/pkg/goanalysis"
 )
 
 func NewDupWord(setting *config.DupWordSettings) *goanalysis.Linter {
@@ -17,6 +17,7 @@ func NewDupWord(setting *config.DupWordSettings) *goanalysis.Linter {
 	if setting != nil {
 		cfgMap[a.Name] = map[string]any{
 			"keyword": strings.Join(setting.Keywords, ","),
+			"ignore":  strings.Join(setting.Ignore, ","),
 		}
 	}
 

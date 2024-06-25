@@ -67,6 +67,11 @@ static void os_init(int argc, char** argv, char* data, size_t data_size)
 	got = mmap(data + data_size, SYZ_PAGE_SIZE, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
 	if (data + data_size != got)
 		failmsg("mmap of right data PROT_NONE page failed", "want %p, got %p", data + data_size, got);
+
+	// A SIGCHLD handler makes sleep in loop exit immediately return with EINTR with a child exits.
+	struct sigaction act = {};
+	act.sa_handler = [](int) {};
+	sigaction(SIGCHLD, &act, nullptr);
 }
 
 static intptr_t execute_syscall(const call_t* c, intptr_t a[kMaxArgs])
@@ -95,11 +100,9 @@ static void cover_protect(cover_t* cov)
 {
 }
 
-#if SYZ_EXECUTOR_USES_SHMEM
 static void cover_unprotect(cover_t* cov)
 {
 }
-#endif
 
 static void cover_mmap(cover_t* cov)
 {
@@ -107,8 +110,22 @@ static void cover_mmap(cover_t* cov)
 		fail("cover_mmap invoked on an already mmapped cover_t object");
 	if (cov->mmap_alloc_size == 0)
 		fail("cover_t structure is corrupted");
-	cov->data = (char*)mmap(NULL, cov->mmap_alloc_size,
-				PROT_READ | PROT_WRITE, MAP_SHARED, cov->fd, 0);
+	// Allocate kcov buffer plus two guard pages surrounding it.
+	char* mapped = (char*)mmap(NULL, cov->mmap_alloc_size + 2 * SYZ_PAGE_SIZE,
+				   PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (mapped == MAP_FAILED)
+		exitf("failed to preallocate kcov buffer");
+	// Protect the guard pages.
+	int res = mprotect(mapped, SYZ_PAGE_SIZE, PROT_NONE);
+	if (res == -1)
+		exitf("failed to protect kcov guard page");
+	res = mprotect(mapped + SYZ_PAGE_SIZE + cov->mmap_alloc_size,
+		       SYZ_PAGE_SIZE, PROT_NONE);
+	if (res == -1)
+		exitf("failed to protect kcov guard page");
+	// Now map the kcov buffer to the file, overwriting the existing mapping above.
+	cov->data = (char*)mmap(mapped + SYZ_PAGE_SIZE, cov->mmap_alloc_size,
+				PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, cov->fd, 0);
 	if (cov->data == MAP_FAILED)
 		exitf("cover mmap failed");
 	cov->data_end = cov->data + cov->mmap_alloc_size;
@@ -160,26 +177,45 @@ static void cover_collect(cover_t* cov)
 		cov->size = *(uint32*)cov->data;
 }
 
-#if SYZ_EXECUTOR_USES_SHMEM
 static bool use_cover_edges(uint32 pc)
 {
 	return true;
 }
 
+static bool is_kernel_data(uint64 addr)
+{
+	if (is_gvisor)
+		return false;
+#if GOARCH_386 || GOARCH_amd64
+	// This range corresponds to the first 1TB of the physical memory mapping,
+	// see Documentation/arch/x86/x86_64/mm.rst.
+	return addr >= 0xffff880000000000ull && addr < 0xffff890000000000ull;
+#else
+	return false;
+#endif
+}
+
+// Returns >0 for yes, <0 for no, 0 for don't know.
+static int is_kernel_pc(uint64 pc)
+{
+	if (is_gvisor)
+		return 0;
+#if GOARCH_386 || GOARCH_amd64
+	// Text/modules range for x86_64.
+	return pc >= 0xffffffff80000000ull && pc < 0xffffffffff000000ull ? 1 : -1;
+#else
+	return 0;
+#endif
+}
+
 static bool use_cover_edges(uint64 pc)
 {
-#if defined(__i386__) || defined(__x86_64__)
+#if GOARCH_amd64 || GOARCH_arm64
 	if (is_gvisor)
 		return false; // gvisor coverage is not a trace, so producing edges won't work
-	// Text/modules range for x86_64.
-	if (pc < 0xffffffff80000000ull || pc >= 0xffffffffff000000ull) {
-		debug("got bad pc: 0x%llx\n", pc);
-		doexit(0);
-	}
 #endif
 	return true;
 }
-#endif
 
 static bool detect_kernel_bitness()
 {
@@ -242,13 +278,86 @@ NORETURN void doexit_thread(int status)
 	}
 }
 
+#define SYZ_HAVE_KCSAN 1
+static void setup_kcsan_filter(const std::vector<std::string>& frames)
+{
+	if (frames.empty())
+		return;
+	int fd = open("/sys/kernel/debug/kcsan", O_WRONLY);
+	if (fd == -1)
+		fail("failed to open kcsan debugfs file");
+	for (const auto& frame : frames)
+		dprintf(fd, "!%s\n", frame.c_str());
+	close(fd);
+}
+
+static const char* setup_nicvf()
+{
+	// This feature has custom checking precedure rather than just rely on running
+	// a simple program with this feature enabled b/c find_vf_interface cannot be made
+	// failing. It searches for the nic in init namespace, but then the nic is moved
+	// to one of testing namespace, so if number of procs is more than the number of devices,
+	// then some of them won't fine a nic (the code is also racy, more than one proc
+	// can find the same device and then moving it will fail for all but one).
+	// So we have to make find_vf_interface non-failing in case of failures,
+	// which means we cannot use it for feature checking.
+	int fd = open("/sys/bus/pci/devices/0000:00:11.0/", O_RDONLY | O_NONBLOCK);
+	if (fd == -1)
+		return "PCI device 0000:00:11.0 is not available";
+	close(fd);
+	return NULL;
+}
+
+static const char* setup_devlink_pci()
+{
+	// See comment in setup_nicvf.
+	int fd = open("/sys/bus/pci/devices/0000:00:10.0/", O_RDONLY | O_NONBLOCK);
+	if (fd == -1)
+		return "PCI device 0000:00:10.0 is not available";
+	close(fd);
+	return NULL;
+}
+
+static const char* setup_delay_kcov()
+{
+	int fd = open("/sys/kernel/debug/kcov", O_RDWR);
+	if (fd == -1)
+		return "open of /sys/kernel/debug/kcov failed";
+	close(fd);
+	cover_t cov = {};
+	cov.fd = kCoverFd;
+	cover_open(&cov, false);
+	cover_mmap(&cov);
+	char* first = cov.data;
+	cov.data = nullptr;
+	cover_mmap(&cov);
+	// If delayed kcov mmap is not supported by the kernel,
+	// accesses to the second mapping will crash.
+	// Use clock_gettime to check if it's mapped w/o crashing the process.
+	const char* error = NULL;
+	timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
+		if (errno != EFAULT)
+			fail("clock_gettime failed");
+		error = "kernel commit b3d7fe86fbd0 is not present";
+	} else {
+		munmap(cov.data - SYZ_PAGE_SIZE, cov.mmap_alloc_size + 2 * SYZ_PAGE_SIZE);
+	}
+	munmap(first - SYZ_PAGE_SIZE, cov.mmap_alloc_size + 2 * SYZ_PAGE_SIZE);
+	close(cov.fd);
+	return error;
+}
+
 #define SYZ_HAVE_FEATURES 1
 static feature_t features[] = {
-    {"leak", setup_leak},
-    {"fault", setup_fault},
-    {"binfmt_misc", setup_binfmt_misc},
-    {"kcsan", setup_kcsan},
-    {"usb", setup_usb},
-    {"802154", setup_802154},
-    {"swap", setup_swap},
+    {rpc::Feature::DelayKcovMmap, setup_delay_kcov},
+    {rpc::Feature::Fault, setup_fault},
+    {rpc::Feature::Leak, setup_leak},
+    {rpc::Feature::KCSAN, setup_kcsan},
+    {rpc::Feature::USBEmulation, setup_usb},
+    {rpc::Feature::LRWPANEmulation, setup_802154},
+    {rpc::Feature::BinFmtMisc, setup_binfmt_misc},
+    {rpc::Feature::Swap, setup_swap},
+    {rpc::Feature::NicVF, setup_nicvf},
+    {rpc::Feature::DevlinkPCI, setup_devlink_pci},
 };

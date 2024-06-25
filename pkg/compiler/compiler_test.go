@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/serializer"
+	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -66,7 +67,7 @@ func TestData(t *testing.T) {
 	// E.g. if we failed to parse descriptions, we won't run type checking at all.
 	// Because of this we have one file per phase.
 	for _, name := range []string{"errors.txt", "errors2.txt", "errors3.txt", "warnings.txt", "all.txt"} {
-		for _, arch := range []string{targets.TestArch32Shmem, targets.TestArch64} {
+		for _, arch := range []string{targets.TestArch32, targets.TestArch64} {
 			name, arch := name, arch
 			t.Run(fmt.Sprintf("%v/%v", name, arch), func(t *testing.T) {
 				t.Parallel()
@@ -280,16 +281,16 @@ func TestCollectUnused(t *testing.T) {
 	for i, input := range inputs {
 		desc := ast.Parse([]byte(input.text), "input", nil)
 		if desc == nil {
-			t.Fatalf("Test %d: failed to parse", i)
+			t.Fatalf("test %d: failed to parse", i)
 		}
 
 		nodes, err := CollectUnused(desc, targets.List[targets.TestOS][targets.TestArch64], nil)
 		if err != nil {
-			t.Fatalf("Test %d: CollectUnused failed: %v", i, err)
+			t.Fatalf("test %d: CollectUnused failed: %v", i, err)
 		}
 
 		if len(input.names) != len(nodes) {
-			t.Errorf("Test %d: want %d nodes, got %d", i, len(input.names), len(nodes))
+			t.Errorf("test %d: want %d nodes, got %d", i, len(input.names), len(nodes))
 		}
 
 		names := make([]string, len(nodes))
@@ -301,7 +302,86 @@ func TestCollectUnused(t *testing.T) {
 		sort.Strings(input.names)
 
 		if !reflect.DeepEqual(names, input.names) {
-			t.Errorf("Test %d: Unused nodes differ. Want %v, Got %v", i, input.names, names)
+			t.Errorf("test %d: Unused nodes differ. Want %v, Got %v", i, input.names, names)
+		}
+	}
+}
+
+func TestFlattenFlags(t *testing.T) {
+	t.Parallel()
+	const input = `
+flags1 = 1, 2, 3, flags2
+flags2 = 4, 5, 6
+
+foo$1(a int32[flags1], b int32[flags2])
+
+str1 = "three", "four"
+str2 = "one", "two", str1
+
+foo$2(a ptr[in, string[str1]], b ptr[in, string[str2]])
+	`
+	expectedInts := map[string][]uint64{
+		"flags1": {1, 2, 3, 4, 5, 6},
+		"flags2": {4, 5, 6},
+	}
+	expectedStrings := map[string][]string{
+		"str1": {"three\x00", "four\x00"},
+		"str2": {"one\x00", "two\x00", "three\x00", "four\x00"},
+	}
+	eh := func(pos ast.Pos, msg string) {
+		t.Errorf("%v: %v", pos, msg)
+	}
+	desc := ast.Parse([]byte(input), "input", eh)
+	if desc == nil {
+		t.Fatal("failed to parse")
+	}
+	p := Compile(desc, map[string]uint64{"SYS_foo": 1}, targets.List[targets.TestOS][targets.TestArch64], eh)
+	if p == nil {
+		t.Fatal("failed to compile")
+	}
+
+	for _, n := range p.Types {
+		switch typ := n.(type) {
+		case *prog.FlagsType:
+			expected := expectedInts[typ.TypeName]
+			if !reflect.DeepEqual(typ.Vals, expected) {
+				t.Fatalf("unexpected values %v for flags %v, expected %v", typ.Vals, typ.TypeName, expected)
+			}
+		case *prog.BufferType:
+			expected := expectedStrings[typ.SubKind]
+			if !reflect.DeepEqual(typ.Values, expected) {
+				t.Fatalf("unexpected values %v for flags %v, expected %v", typ.Values, typ.SubKind, expected)
+			}
+		}
+	}
+}
+
+func TestSquashablePtr(t *testing.T) {
+	t.Parallel()
+	// recursive must not be marked as squashable b/c it contains a pointer.
+	const input = `
+foo(a ptr[in, recursive])
+
+recursive {
+	f0	ptr[in, recursive, opt]
+	f1	int32
+	f2	array[int8]
+}
+`
+	eh := func(pos ast.Pos, msg string) {
+		t.Errorf("%v: %v", pos, msg)
+	}
+	desc := ast.Parse([]byte(input), "input", eh)
+	if desc == nil {
+		t.Fatal("failed to parse")
+	}
+	p := Compile(desc, map[string]uint64{"SYS_foo": 1}, targets.List[targets.TestOS][targets.TestArch64], eh)
+	if p == nil {
+		t.Fatal("failed to compile")
+	}
+	for _, typ := range p.Types {
+		if ptr, ok := typ.(*prog.PtrType); ok && ptr.SquashableElem {
+			t.Fatal("got squashable ptr")
 		}
 	}
 }

@@ -104,16 +104,39 @@ func (s *state) analyzeImpl(c *Call, resources bool) {
 	})
 }
 
+type parentStack []Arg
+
+func allocStack() parentStack {
+	// Let's save some allocations during stack traversal.
+	return make([]Arg, 0, 4)
+}
+
+func pushStack(ps parentStack, a Arg) parentStack {
+	return append(ps, a)
+}
+
+func popStack(ps parentStack) (parentStack, Arg) {
+	if len(ps) > 0 {
+		return ps[:len(ps)-1], ps[len(ps)-1]
+	}
+	return ps, nil
+}
+
 type ArgCtx struct {
-	Parent *[]Arg      // GroupArg.Inner (for structs) or Call.Args containing this arg.
-	Fields []Field     // Fields of the parent struct/syscall.
-	Base   *PointerArg // Pointer to the base of the heap object containing this arg.
-	Offset uint64      // Offset of this arg from the base.
-	Stop   bool        // If set by the callback, subargs of this arg are not visited.
+	Parent      *[]Arg      // GroupArg.Inner (for structs) or Call.Args containing this arg.
+	Fields      []Field     // Fields of the parent struct/syscall.
+	Base        *PointerArg // Pointer to the base of the heap object containing this arg.
+	Offset      uint64      // Offset of this arg from the base.
+	Stop        bool        // If set by the callback, subargs of this arg are not visited.
+	parentStack parentStack // Struct and union arguments by which the argument can be reached.
 }
 
 func ForeachSubArg(arg Arg, f func(Arg, *ArgCtx)) {
 	foreachArgImpl(arg, &ArgCtx{}, f)
+}
+
+func foreachSubArgWithStack(arg Arg, f func(Arg, *ArgCtx)) {
+	foreachArgImpl(arg, &ArgCtx{parentStack: allocStack()}, f)
 }
 
 func ForeachArg(c *Call, f func(Arg, *ArgCtx)) {
@@ -131,6 +154,13 @@ func ForeachArg(c *Call, f func(Arg, *ArgCtx)) {
 func foreachArgImpl(arg Arg, ctx *ArgCtx, f func(Arg, *ArgCtx)) {
 	ctx0 := *ctx
 	defer func() { *ctx = ctx0 }()
+
+	if ctx.parentStack != nil {
+		switch arg.Type().(type) {
+		case *StructType, *UnionType:
+			ctx.parentStack = pushStack(ctx.parentStack, arg)
+		}
+	}
 	f(arg, ctx)
 	if ctx.Stop {
 		return
@@ -155,11 +185,13 @@ func foreachArgImpl(arg Arg, ctx *ArgCtx, f func(Arg, *ArgCtx)) {
 				totalSize = ctx.Offset - ctx0.Offset
 			}
 		}
-		claimedSize := a.Size()
-		varlen := a.Type().Varlen()
-		if varlen && totalSize > claimedSize || !varlen && totalSize != claimedSize {
-			panic(fmt.Sprintf("bad group arg size %v, should be <= %v for %#v type %#v",
-				totalSize, claimedSize, a, a.Type().Name()))
+		if debug {
+			claimedSize := a.Size()
+			varlen := a.Type().Varlen()
+			if varlen && totalSize > claimedSize || !varlen && totalSize != claimedSize {
+				panic(fmt.Sprintf("bad group arg size %v, should be <= %v for %#v type %#v",
+					totalSize, claimedSize, a, a.Type().Name()))
+			}
 		}
 	case *PointerArg:
 		if a.Res != nil {
@@ -213,7 +245,7 @@ const (
 type CallInfo struct {
 	Flags  CallFlags
 	Errno  int
-	Signal []uint32
+	Signal []uint64
 }
 
 const (
@@ -313,7 +345,7 @@ func extractArgSignal(arg Arg, callID, flags int, inf *CallInfo, resources map[*
 	return flags
 }
 
-func DecodeFallbackSignal(s uint32) (callID, errno int) {
+func DecodeFallbackSignal(s uint64) (callID, errno int) {
 	typ, id, aux := decodeFallbackSignal(s)
 	switch typ {
 	case fallbackSignalErrno, fallbackSignalErrnoBlocked:
@@ -325,15 +357,15 @@ func DecodeFallbackSignal(s uint32) (callID, errno int) {
 	}
 }
 
-func encodeFallbackSignal(typ, id, aux int) uint32 {
+func encodeFallbackSignal(typ, id, aux int) uint64 {
 	checkMaxCallID(id)
 	if typ & ^7 != 0 {
 		panic(fmt.Sprintf("bad fallback signal type %v", typ))
 	}
-	return uint32(typ) | uint32(id&fallbackCallMask)<<3 | uint32(aux)<<24
+	return uint64(typ) | uint64(id&fallbackCallMask)<<3 | uint64(aux)<<24
 }
 
-func decodeFallbackSignal(s uint32) (typ, id, aux int) {
+func decodeFallbackSignal(s uint64) (typ, id, aux int) {
 	return int(s & 7), int((s >> 3) & fallbackCallMask), int(s >> 24)
 }
 
@@ -364,4 +396,13 @@ func (p *Prog) ForEachAsset(cb func(name string, typ AssetType, r io.Reader)) {
 			cb(fmt.Sprintf("mount_%v", id), MountInRepro, bytes.NewReader(data))
 		})
 	}
+}
+
+func (p *Prog) ContainsAny() bool {
+	for _, c := range p.Calls {
+		if p.Target.CallContainsAny(c) {
+			return true
+		}
+	}
+	return false
 }

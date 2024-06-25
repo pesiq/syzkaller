@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/syzkaller/pkg/bisect/minimize"
 	"github.com/google/syzkaller/pkg/csource"
-	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -69,12 +69,13 @@ type context struct {
 type execInterface interface {
 	Close()
 	RunCProg(p *prog.Prog, duration time.Duration, opts csource.Options) (*instance.RunResult, error)
-	RunSyzProg(syzProg []byte, duration time.Duration, opts csource.Options) (*instance.RunResult, error)
+	RunSyzProg(syzProg []byte, duration time.Duration, opts csource.Options, exitCondition vm.ExitCondition) (
+		*instance.RunResult, error)
 }
 
 var ErrNoPrograms = errors.New("crash log does not contain any programs")
 
-func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, reporter *report.Reporter,
+func Run(crashLog []byte, cfg *mgrconfig.Config, features flatrpc.Feature, reporter *report.Reporter,
 	vmPool *vm.Pool, vmIndexes []int) (*Result, *Stats, error) {
 	ctx, err := prepareCtx(crashLog, cfg, features, reporter, len(vmIndexes))
 	if err != nil {
@@ -95,7 +96,7 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, report
 	return ctx.run()
 }
 
-func prepareCtx(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, reporter *report.Reporter,
+func prepareCtx(crashLog []byte, cfg *mgrconfig.Config, features flatrpc.Feature, reporter *report.Reporter,
 	VMs int) (*context, error) {
 	if VMs == 0 {
 		return nil, fmt.Errorf("no VMs provided")
@@ -178,40 +179,38 @@ func (ctx *context) run() (*Result, *Stats, error) {
 	return res, ctx.stats, nil
 }
 
-func createStartOptions(cfg *mgrconfig.Config, features *host.Features,
+func createStartOptions(cfg *mgrconfig.Config, features flatrpc.Feature,
 	crashType crash.Type) csource.Options {
 	opts := csource.DefaultOpts(cfg)
 	if crashType == crash.MemoryLeak {
 		opts.Leak = true
 	}
-	if features != nil {
-		if !features[host.FeatureNetInjection].Enabled {
-			opts.NetInjection = false
-		}
-		if !features[host.FeatureNetDevices].Enabled {
-			opts.NetDevices = false
-		}
-		if !features[host.FeatureDevlinkPCI].Enabled {
-			opts.DevlinkPCI = false
-		}
-		if !features[host.FeatureNicVF].Enabled {
-			opts.NicVF = false
-		}
-		if !features[host.FeatureUSBEmulation].Enabled {
-			opts.USB = false
-		}
-		if !features[host.FeatureVhciInjection].Enabled {
-			opts.VhciInjection = false
-		}
-		if !features[host.FeatureWifiEmulation].Enabled {
-			opts.Wifi = false
-		}
-		if !features[host.Feature802154Emulation].Enabled {
-			opts.IEEE802154 = false
-		}
-		if !features[host.FeatureSwap].Enabled {
-			opts.Swap = false
-		}
+	if features&flatrpc.FeatureNetInjection == 0 {
+		opts.NetInjection = false
+	}
+	if features&flatrpc.FeatureNetDevices == 0 {
+		opts.NetDevices = false
+	}
+	if features&flatrpc.FeatureDevlinkPCI == 0 {
+		opts.DevlinkPCI = false
+	}
+	if features&flatrpc.FeatureNicVF == 0 {
+		opts.NicVF = false
+	}
+	if features&flatrpc.FeatureUSBEmulation == 0 {
+		opts.USB = false
+	}
+	if features&flatrpc.FeatureVhciInjection == 0 {
+		opts.VhciInjection = false
+	}
+	if features&flatrpc.FeatureWifiEmulation == 0 {
+		opts.Wifi = false
+	}
+	if features&flatrpc.FeatureLRWPANEmulation == 0 {
+		opts.IEEE802154 = false
+	}
+	if features&flatrpc.FeatureSwap == 0 {
+		opts.Swap = false
 	}
 	return opts
 }
@@ -237,11 +236,6 @@ func (ctx *context) repro() (*Result, error) {
 	if res == nil {
 		return nil, nil
 	}
-	defer func() {
-		if res != nil {
-			res.Opts.Repro = false
-		}
-	}()
 	res, err = ctx.minimizeProg(res)
 	if err != nil {
 		return nil, err
@@ -357,8 +351,18 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 		return baseDuration + time.Duration(entries/4)*time.Second
 	}
 
+	// First check if replaying the log may crash the kernel at all.
+	ret, err := ctx.testProgs(entries, duration(len(entries)), opts)
+	if !ret {
+		ctx.reproLogf(3, "replaying the whole log did not cause a kernel crash")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
 	// Bisect the log to find multiple guilty programs.
-	entries, err := ctx.bisectProgs(entries, func(progs []*prog.LogEntry) (bool, error) {
+	entries, err = ctx.bisectProgs(entries, func(progs []*prog.LogEntry) (bool, error) {
 		return ctx.testProgs(progs, duration(len(progs)), opts)
 	})
 	if err != nil {
@@ -375,29 +379,70 @@ func (ctx *context) extractProgBisect(entries []*prog.LogEntry, baseDuration tim
 	ctx.reproLogf(3, "bisect: trying to concatenate")
 
 	// Concatenate all programs into one.
-	prog := &prog.Prog{
+	dur := duration(len(entries)) * 3 / 2
+	return ctx.concatenateProgs(entries, dur)
+}
+
+// The bisected progs may exceed the prog.MaxCalls limit.
+// So let's first try to drop unneeded calls.
+func (ctx *context) concatenateProgs(entries []*prog.LogEntry, dur time.Duration) (*Result, error) {
+	ctx.reproLogf(3, "bisect: concatenate %d entries", len(entries))
+	if len(entries) > 1 {
+		// There's a risk of exceeding prog.MaxCalls, so let's first minimize
+		// all entries separately.
+		for i := 0; i < len(entries); i++ {
+			ctx.reproLogf(1, "minimizing program #%d before concatenation", i)
+			callsBefore := len(entries[i].P.Calls)
+			entries[i].P, _ = prog.Minimize(entries[i].P, -1, prog.MinimizeParams{
+				RemoveCallsOnly: true,
+			},
+				func(p1 *prog.Prog, _ int) bool {
+					var newEntries []*prog.LogEntry
+					if i > 0 {
+						newEntries = append(newEntries, entries[:i]...)
+					}
+					newEntries = append(newEntries, &prog.LogEntry{
+						P: p1,
+					})
+					if i+1 < len(entries) {
+						newEntries = append(newEntries, entries[i+1:]...)
+					}
+					crashed, err := ctx.testProgs(newEntries, dur, ctx.startOpts)
+					if err != nil {
+						ctx.reproLogf(0, "concatenation step failed with %v", err)
+						return false
+					}
+					return crashed
+				})
+			ctx.reproLogf(1, "minimized %d calls -> %d calls", callsBefore, len(entries[i].P.Calls))
+		}
+	}
+	p := &prog.Prog{
 		Target: entries[0].P.Target,
 	}
 	for _, entry := range entries {
-		prog.Calls = append(prog.Calls, entry.P.Calls...)
+		p.Calls = append(p.Calls, entry.P.Calls...)
 	}
-	dur := duration(len(entries)) * 3 / 2
-	crashed, err := ctx.testProg(prog, dur, opts)
+	if len(p.Calls) > prog.MaxCalls {
+		ctx.reproLogf(2, "bisect: concatenated prog still exceeds %d calls", prog.MaxCalls)
+		return nil, nil
+	}
+	crashed, err := ctx.testProg(p, dur, ctx.startOpts)
 	if err != nil {
+		ctx.reproLogf(3, "bisect: error during concatenation testing: %v", err)
 		return nil, err
 	}
-	if crashed {
-		res := &Result{
-			Prog:     prog,
-			Duration: dur,
-			Opts:     opts,
-		}
-		ctx.reproLogf(3, "bisect: concatenation succeeded")
-		return res, nil
+	if !crashed {
+		ctx.reproLogf(3, "bisect: concatenated prog does not crash")
+		return nil, nil
 	}
-
-	ctx.reproLogf(3, "bisect: concatenation failed")
-	return nil, nil
+	res := &Result{
+		Prog:     p,
+		Duration: dur,
+		Opts:     ctx.startOpts,
+	}
+	ctx.reproLogf(3, "bisect: concatenation succeeded")
+	return res, nil
 }
 
 // Minimize calls and arguments.
@@ -408,7 +453,7 @@ func (ctx *context) minimizeProg(res *Result) (*Result, error) {
 		ctx.stats.MinimizeProgTime = time.Since(start)
 	}()
 
-	res.Prog, _ = prog.Minimize(res.Prog, -1, true,
+	res.Prog, _ = prog.Minimize(res.Prog, -1, prog.MinimizeParams{Light: true},
 		func(p1 *prog.Prog, callIndex int) bool {
 			crashed, err := ctx.testProg(p1, res.Duration, res.Opts)
 			if err != nil {
@@ -576,6 +621,9 @@ func (ctx *context) runOnInstance(callback func(execInterface) (rep *instance.Ru
 func encodeEntries(entries []*prog.LogEntry) []byte {
 	buf := new(bytes.Buffer)
 	for _, ent := range entries {
+		if len(ent.P.Calls) > prog.MaxCalls {
+			panic("prog.MaxCalls is exceeded")
+		}
 		fmt.Fprintf(buf, "executing program %v:\n%v", ent.Proc, string(ent.P.Serialize()))
 	}
 	return buf.Bytes()
@@ -601,7 +649,7 @@ func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, 
 	ctx.reproLogf(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
 	ctx.reproLogf(3, "detailed listing:\n%s", pstr)
 	return ctx.testWithInstance(func(exec execInterface) (*instance.RunResult, error) {
-		return exec.RunSyzProg(pstr, duration, opts)
+		return exec.RunSyzProg(pstr, duration, opts, instance.SyzExitConditions)
 	})
 }
 
@@ -612,8 +660,8 @@ func (ctx *context) testCProg(p *prog.Prog, duration time.Duration, opts csource
 }
 
 func (ctx *context) returnInstance(inst *reproInstance) {
-	ctx.bootRequests <- inst.index
 	inst.execProg.Close()
+	ctx.bootRequests <- inst.index
 }
 
 func (ctx *context) reproLogf(level int, format string, args ...interface{}) {
@@ -640,7 +688,7 @@ func (ctx *context) bisectProgs(progs []*prog.LogEntry, pred func([]*prog.LogEnt
 		Pred: minimizePred,
 		// For flaky crashes we usually end up with too many chunks.
 		// Continuing bisection would just take a lot of time and likely produce no result.
-		MaxChunks: 8,
+		MaxChunks: 6,
 		Logf: func(msg string, args ...interface{}) {
 			ctx.reproLogf(3, "bisect: "+msg, args...)
 		},
@@ -660,28 +708,21 @@ func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
 		go func() {
 			defer wg.Done()
 
-			var inst *instance.ExecProgInstance
-			maxTry := 3
-			for try := 0; try < maxTry; try++ {
+			for try := 0; ; try++ {
 				select {
 				case <-vm.Shutdown:
-					try = maxTry
-					continue
+					return
 				default:
 				}
-				var err error
-				inst, err = instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
+				inst, err := instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
 					ctx.reporter, &instance.OptionalConfig{Logf: ctx.reproLogf})
 				if err != nil {
-					ctx.reproLogf(0, "failed to init instance: %v, attempt %d/%d",
-						err, try+1, maxTry)
+					ctx.reproLogf(0, "failed to boot instance (try %v): %v", try+1, err)
 					time.Sleep(10 * time.Second)
 					continue
 				}
-				break
-			}
-			if inst != nil {
 				ctx.instances <- &reproInstance{execProg: inst, index: vmIndex}
+				break
 			}
 		}()
 	}

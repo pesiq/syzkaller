@@ -14,6 +14,8 @@ type customRules struct {
 	extraSubsystems map[string][]string
 	// For these subsystems we do not generate monthly reminders.
 	noReminders map[string]struct{}
+	// We don't want to tag these subsystems in the reports of its sub-subsystem bugs.
+	noIndirectCc map[string]struct{}
 	// Extra child->[]parent links (on top of the inferred ones).
 	addParents map[string][]string
 }
@@ -23,6 +25,7 @@ var (
 		subsystemCalls: map[string][]string{
 			"adfs":      {"syz_mount_image$adfs"},
 			"affs":      {"syz_mount_image$affs"},
+			"bcachefs":  {"syz_mount_image$bcachefs"},
 			"befs":      {"syz_mount_image$befs"},
 			"bfs":       {"syz_mount_image$bfs"},
 			"bluetooth": {"syz_emit_vhci"},
@@ -49,8 +52,7 @@ var (
 			"kvm":      {"syz_kvm_setup_cpu"},
 			"minix":    {"syz_mount_image$minix"},
 			"nilfs":    {"syz_mount_image$nilfs2"},
-			"ntfs":     {"syz_mount_image$ntfs"},
-			"ntfs3":    {"syz_mount_image$ntfs3"},
+			"ntfs3":    {"syz_mount_image$ntfs", "syz_mount_image$ntfs3"},
 			"ocfs2":    {"syz_mount_image$ocfs2"},
 			"omfs":     {"syz_mount_image$omfs"},
 			"qnx4":     {"syz_mount_image$qnx4"},
@@ -94,6 +96,7 @@ var (
 			"nfc":    {"NFC SUBSYSTEM"},
 			"iomap":  {"FILESYSTEMS [IOMAP]"},
 			"xfs":    {"XFS FILESYSTEM"},
+			"jffs2":  {"JOURNALLING FLASH FILE SYSTEM V2 (JFFS2)"},
 		},
 		noReminders: map[string]struct{}{
 			// Many misclassified bugs end up in `kernel`, so there's no sense
@@ -103,6 +106,9 @@ var (
 		addParents: map[string][]string{
 			// By MAINTAINERS, wireless is somewhat separate, but it's better to keep it as a net child.
 			"wireless": {"net"},
+		},
+		noIndirectCc: map[string]struct{}{
+			"fs": {},
 		},
 	}
 )
