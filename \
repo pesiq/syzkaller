@@ -27,14 +27,14 @@ typedef struct {
 }test_args;
 
 typedef struct {
-  unsigned char field1;
-  int field2;
+  char field1;
+  float field2;
   short field3;
 }padding_default;
 
 typedef struct __attribute__((packed)) {
   char field1;
-  unsigned int field2;
+  int field2;
   short field3;
 } padding_packed;
 

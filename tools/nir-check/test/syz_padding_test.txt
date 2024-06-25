@@ -1,13 +1,13 @@
 
 padding_default {
   field1 int8
-  field2 int32 
+  field2 int32
   field3 int16
 }
 
 padding_packed{
-  field1 int32
-  field2 int32 
+  field1 int8
+  field2 int8 
   field3 int16
 } [packed]
 

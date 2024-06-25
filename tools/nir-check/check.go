@@ -56,7 +56,7 @@ func getStructs() map[string]*ast.Struct {
 	var flagOS = flag.String("os", runtime.GOOS, "OS")
 
 	var arch = "amd64"
-  structTypes, locs, warnings, err := parseDescriptions_custom("syz_padding_test.txt", *flagOS, arch)
+	structTypes, locs, warnings, err := parseDescriptions_custom("syz_test.txt", *flagOS, arch)
 
 	if err != nil {
 		fmt.Errorf("Error: %v", err)
@@ -206,10 +206,3 @@ func parseDescriptions(OS, arch string) ([]prog.Type, map[string]*ast.Struct, []
 	}
 	return structs, locs, warnings, nil
 }
-
-/*
-Получается большую часть времени - реализация
-Но аналитику тоже пишу:
-Конкретно актуальность новизна лалала
-И описание методов различных, которые можно использовать для проверки
-*/

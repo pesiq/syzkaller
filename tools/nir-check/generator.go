@@ -16,8 +16,8 @@ void test_struct_{{.StructName}} () {
 `
 
 const fieldTemplate = `
-	A.{{.FieldName}} = {{.CAP_Type}} - 1;
-	{{.FieldType}} szl_{{.FieldName}} = {{.CAP_Type}} - 1;
+	A.{{.FieldName}} = {{.CAP_Type}} + 1;
+	{{.FieldType}} szl_{{.FieldName}} = {{.CAP_Type}} + 1;
 
 	if ((float)szl_{{.FieldName}} != (float)A.{{.FieldName}}){
     printf("{{.StructName}}: {{.FieldName}}: sign error\n");
@@ -56,12 +56,12 @@ func generateTests(locs map[string]*ast.Struct) {
 		"int64": "long",
 	}
 
-  limits := map[string]string{
-    "int8": "CHAR_MAX",
-    "int16": "SHRT_MAX",
-    "int32": "INT_MAX",
-    "int64": "LONG_MAX",
-  }
+	limits := map[string]string{
+		"int8":  "CHAR_MAX",
+		"int16": "SHRT_MAX",
+		"int32": "INT_MAX",
+		"int64": "LONG_MAX",
+	}
 
 	path := "./algo/test.c"
 
@@ -103,7 +103,7 @@ func generateTests(locs map[string]*ast.Struct) {
 		"FieldName":  "",
 		"FieldType":  "",
 		"Functions":  "",
-    "CAP_Type": "",
+		"CAP_Type":   "",
 	}
 
 	var call_buffer bytes.Buffer
@@ -121,7 +121,7 @@ func generateTests(locs map[string]*ast.Struct) {
 		for _, field := range obj.Fields {
 			data["FieldName"] = field.Name.Name
 			data["FieldType"] = types[field.Type.Ident]
-      data["CAP_Type"] = limits[field.Type.Ident]
+			data["CAP_Type"] = limits[field.Type.Ident]
 
 			TestField.Execute(file, data)
 		}
